@@ -251,7 +251,8 @@ func watchAndTail(cfg config, p *tea.Program) error {
 						continue
 					}
 				}
-				if ev.Has(fsnotify.Write) || ev.Has(fsnotify.Create) {
+				// Treat Chmod as Write on Windows: some tools trigger CHMOD instead of WRITE
+				if ev.Has(fsnotify.Write) || ev.Has(fsnotify.Create) || (runtime.GOOS == "windows" && ev.Has(fsnotify.Chmod)) {
 					_ = readNew(ev.Name)
 				}
 				if ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename) {
@@ -265,6 +266,21 @@ func watchAndTail(cfg config, p *tea.Program) error {
 			}
 		}
 	}()
+
+	// On Windows, some file appends may not reliably emit WRITE events depending on
+	// the writer. Add a light-weight polling fallback that periodically scans
+	// matching files and reads any new data. This keeps behavior consistent
+	// without affecting other platforms.
+	if runtime.GOOS == "windows" {
+		ticker := time.NewTicker(700 * time.Millisecond)
+		go func() {
+			for range ticker.C {
+				for _, f := range listMatchingFiles(absRoot, cfg) {
+					_ = readNew(f)
+				}
+			}
+		}()
+	}
 
 	return nil
 }
