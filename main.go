@@ -362,14 +362,16 @@ func parseArgs() (config, error) {
 }
 
 func main() {
+
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <directory> [pattern] [--recursive]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
+		fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs *.log --recursive")
+		fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs")
+	}
+
 	// Show help and exit if no parameters are provided
 	if len(os.Args) <= 1 {
-		flag.Usage = func() {
-			fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <directory> [pattern] [--recursive]\n", filepath.Base(os.Args[0]))
-			fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
-			fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs *.log --recursive")
-			fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs")
-		}
 		flag.Usage()
 		os.Exit(0)
 	}
