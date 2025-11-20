@@ -87,10 +87,8 @@ func initialModel(cfg config) model {
 	if cfg.recursive {
 		rec = "yes"
 	}
-	info1 := fmt.Sprintf("Watching: %s (recursive: %s, pattern: %s)", abs, rec, pat)
-	info2 := "Press Ctrl+C or q to quit"
-	m.lines = append(m.lines, m.styleText.Render(info1))
-	m.lines = append(m.lines, m.styleText.Render(info2))
+	banner := fmt.Sprintf("logwat - watching: %s (recursive: %s, pattern: %s). Press Ctrl+C or q to quit", abs, rec, pat)
+	m.lines = append(m.lines, m.styleText.Render(banner))
 	return m
 }
 
@@ -114,6 +112,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case logLineMsg:
 		l := logLine(msg)
 		m.lines = append(m.lines, m.formatLine(l))
+		// Todo: why 5000? Put to variable/config...
 		if len(m.lines) > 5000 {
 			m.lines = m.lines[len(m.lines)-5000:]
 		}
@@ -141,7 +140,7 @@ func (m model) formatLine(l logLine) string {
 	ts := m.styleTime.Render(l.when.Format("02.01.2006 15:04:05"))
 	p := l.rel
 	if runtime.GOOS == "windows" {
-		// Show Windows-style backslashes as in the example
+		// Show Windows-style backslashes
 		p = strings.ReplaceAll(filepath.ToSlash(p), "/", "\\")
 	}
 	p = m.stylePath.Render(p)
@@ -267,10 +266,7 @@ func watchAndTail(cfg config, p *tea.Program) error {
 		}
 	}()
 
-	// On Windows, some file appends may not reliably emit WRITE events depending on
-	// the writer. Add a light-weight polling fallback that periodically scans
-	// matching files and reads any new data. This keeps behavior consistent
-	// without affecting other platforms.
+	// On Windows, some file appends may not reliably emit WRITE events depending on the writer.
 	if runtime.GOOS == "windows" {
 		ticker := time.NewTicker(700 * time.Millisecond)
 		go func() {
@@ -296,11 +292,17 @@ func fileMatches(root string, absPath string, cfg config) bool {
 	}
 	base := filepath.Base(absPath)
 	pattern := cfg.pattern
+
 	if pattern == "" {
-		m1, _ := filepath.Match("*.log", base)
-		m2, _ := filepath.Match("*.txt", base)
-		return m1 || m2
+		return true
 	}
+
+	//if pattern == "" {
+	//	m1, _ := filepath.Match("*.log", base)
+	//	m2, _ := filepath.Match("*.txt", base)
+	//	return m1 || m2
+	//}
+
 	ok, _ := filepath.Match(pattern, base)
 	return ok
 }
@@ -341,18 +343,16 @@ func parseArgs() (config, error) {
 	var recursive bool
 	flag.BoolVar(&recursive, "recursive", false, "watch directories recursively")
 	flag.BoolVar(&recursive, "r", false, "watch directories recursively (shorthand)")
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <folder> [pattern] [--recursive]\n", filepath.Base(os.Args[0]))
-		fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
-		fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs *.log --recursive")
-		fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs")
-		fmt.Fprintln(flag.CommandLine.Output(), "\nHints:")
-		fmt.Fprintln(flag.CommandLine.Output(), "  Press Ctrl+C or q to quit")
-	}
+	//flag.Usage = func() {
+	//	fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <folder> [pattern] [--recursive]\n", filepath.Base(os.Args[0]))
+	//	fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
+	//	fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs *.log --recursive")
+	//	fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs")
+	//}
 	flag.Parse()
 	args := flag.Args()
 	if len(args) < 1 {
-		return config{}, fmt.Errorf("missing folder argument")
+		return config{}, fmt.Errorf("missing directory argument")
 	}
 	cfg := config{rootDir: args[0], recursive: recursive}
 	if len(args) >= 2 {
@@ -365,7 +365,7 @@ func main() {
 	// Show help and exit if no parameters are provided
 	if len(os.Args) <= 1 {
 		flag.Usage = func() {
-			fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <folder> [pattern] [--recursive]\n", filepath.Base(os.Args[0]))
+			fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <directory> [pattern] [--recursive]\n", filepath.Base(os.Args[0]))
 			fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
 			fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs *.log --recursive")
 			fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs")
@@ -381,7 +381,7 @@ func main() {
 		os.Exit(2)
 	}
 	if _, err := os.Stat(cfg.rootDir); err != nil {
-		fmt.Fprintln(os.Stderr, "Folder not accessible:", err)
+		fmt.Fprintln(os.Stderr, "Directory not accessible:", err)
 		os.Exit(2)
 	}
 
