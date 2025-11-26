@@ -59,22 +59,45 @@ type logLine struct {
 	text string
 }
 
+type fileState struct {
+	mu    sync.Mutex
+	inode uint64
+	dev   uint64
+	off   int64
+}
+
 type tailState struct {
-	offset sync.Map // string -> *atomic.Int64 for lock-free reads
+	// path -> *fileState
+	meta sync.Map
 }
 
 func newTailState() *tailState { return &tailState{} }
 
-func (t *tailState) get(p string) int64 {
-	if v, ok := t.offset.Load(p); ok {
-		return v.(*atomic.Int64).Load()
+// getOffset decides the starting offset considering inode/dev and truncation.
+// If the stored inode differs from current, it resets offset to 0.
+func (t *tailState) getOffset(path string, curInode, curDev uint64, curSize int64) int64 {
+	v, _ := t.meta.LoadOrStore(path, &fileState{})
+	fs := v.(*fileState)
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	// inode change => rotated/recreated file at same path
+	if (fs.inode != 0 && (fs.inode != curInode || fs.dev != curDev)) || (curSize < fs.off) {
+		fs.inode, fs.dev, fs.off = curInode, curDev, 0
+		return 0
 	}
-	return 0
+	// first time we see file
+	if fs.inode == 0 && (curInode != 0 || curDev != 0) {
+		fs.inode, fs.dev = curInode, curDev
+	}
+	return fs.off
 }
 
-func (t *tailState) set(p string, off int64) {
-	v, _ := t.offset.LoadOrStore(p, &atomic.Int64{})
-	v.(*atomic.Int64).Store(off)
+func (t *tailState) setOffset(path string, curInode, curDev uint64, off int64) {
+	v, _ := t.meta.LoadOrStore(path, &fileState{})
+	fs := v.(*fileState)
+	fs.mu.Lock()
+	fs.inode, fs.dev, fs.off = curInode, curDev, off
+	fs.mu.Unlock()
 }
 
 type model struct {
@@ -689,11 +712,38 @@ func watchAndTail(ctx context.Context, cfg config, p *tea.Program) error {
 	state := newTailState()
 	primeOffsets(absRoot, cfg, state)
 
+	// Async pipeline: readers -> linesCh (bounded, with drop counter) -> parser -> UI
+	linesCh := make(chan logLine, 4096)
+	dropped := &atomic.Int64{}
+
 	var wg sync.WaitGroup
+	// Parser/forwarder goroutine
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		handleFsnotifyEvents(ctx, watcher, absRoot, cfg, state, p)
+		ticker := time.NewTicker(300 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case l := <-linesCh:
+				p.Send(logLineMsg(l))
+			case <-ticker.C:
+				if n := dropped.Swap(0); n > 0 {
+					// Emit a synthetic drop notice
+					txt := fmt.Sprintf("[backpressure] dropped %s lines", strconv.FormatInt(n, 10))
+					p.Send(logLineMsg{when: time.Now(), rel: "info", text: txt})
+				}
+			}
+		}
+	}()
+
+	// fsnotify reader goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		handleFsnotifyEvents(ctx, watcher, absRoot, cfg, state, p, linesCh, dropped)
 	}()
 
 	// Wait for context cancellation
@@ -732,12 +782,13 @@ func collectDirs(root string, recursive bool) ([]string, error) {
 func primeOffsets(root string, cfg config, state *tailState) {
 	for _, f := range listMatchingFiles(root, cfg) {
 		if fi, err := os.Stat(f); err == nil {
-			state.set(f, fi.Size())
+			ino, dev := inodeDev(fi)
+			state.setOffset(f, ino, dev, fi.Size())
 		}
 	}
 }
 
-func handleFsnotifyEvents(ctx context.Context, watcher *fsnotify.Watcher, absRoot string, cfg config, state *tailState, p *tea.Program) {
+func handleFsnotifyEvents(ctx context.Context, watcher *fsnotify.Watcher, absRoot string, cfg config, state *tailState, p *tea.Program, out chan<- logLine, dropped *atomic.Int64) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -758,10 +809,11 @@ func handleFsnotifyEvents(ctx context.Context, watcher *fsnotify.Watcher, absRoo
 				}
 			}
 			if ev.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-				_ = readNewLines(ev.Name, absRoot, cfg, state, p)
+				_ = readNewLines(ctx, ev.Name, absRoot, cfg, state, out, dropped)
 			}
 			if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-				state.set(ev.Name, 0)
+				// reset stored state for this path
+				state.setOffset(ev.Name, 0, 0, 0)
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -772,7 +824,7 @@ func handleFsnotifyEvents(ctx context.Context, watcher *fsnotify.Watcher, absRoo
 	}
 }
 
-func readNewLines(path, root string, cfg config, state *tailState, p *tea.Program) error {
+func readNewLines(ctx context.Context, path, root string, cfg config, state *tailState, out chan<- logLine, dropped *atomic.Int64) error {
 	if !fileMatches(root, path, cfg) {
 		return nil
 	}
@@ -783,16 +835,12 @@ func readNewLines(path, root string, cfg config, state *tailState, p *tea.Progra
 	}
 	defer f.Close()
 
-	start := state.get(path)
 	fi, err := f.Stat()
 	if err != nil {
 		return err
 	}
-
-	// Handle log rotation (file truncated)
-	if fi.Size() < start {
-		start = 0
-	}
+	ino, dev := inodeDev(fi)
+	start := state.getOffset(path, ino, dev, fi.Size())
 
 	if _, err := f.Seek(start, io.SeekStart); err != nil {
 		return err
@@ -803,18 +851,40 @@ func readNewLines(path, root string, cfg config, state *tailState, p *tea.Progra
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		t := time.Now()
 		if cfg.utc {
 			t = t.UTC()
 		}
-		p.Send(logLineMsg{when: t, rel: rel, text: scanner.Text()})
+		l := logLine{when: t, rel: rel, text: scanner.Text()}
+		select {
+		case out <- l:
+		default:
+			dropped.Add(1)
+		}
 	}
 
 	if pos, err := f.Seek(0, io.SeekCurrent); err == nil {
-		state.set(path, pos)
+		state.setOffset(path, ino, dev, pos)
 	}
 
 	return scanner.Err()
+}
+
+// inodeDev returns inode and device id for Linux/Unix platforms; on unsupported
+// systems it returns zeros, which will degrade to path-only tracking.
+func inodeDev(fi os.FileInfo) (uint64, uint64) {
+	if fi == nil {
+		return 0, 0
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return uint64(st.Ino), uint64(st.Dev)
+	}
+	return 0, 0
 }
 
 func fileMatches(root, absPath string, cfg config) bool {
