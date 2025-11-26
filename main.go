@@ -14,6 +14,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -80,6 +82,9 @@ type model struct {
 	styleTime    lipgloss.Style
 	stylePath    lipgloss.Style
 	styleText    lipgloss.Style
+	styleInfo    lipgloss.Style
+	styleWarn    lipgloss.Style
+	styleError   lipgloss.Style
 	cfg          config
 	err          error
 	flushDue     bool
@@ -98,6 +103,11 @@ type model struct {
 	entriesSize int
 	// dedup tracking (ignoring timestamp): last emitted key and count
 	lastKeyNoTS string
+
+	// precompiled highlight regexes
+	reErr  *regexp.Regexp
+	reWarn *regexp.Regexp
+	reInfo *regexp.Regexp
 }
 
 type (
@@ -113,6 +123,9 @@ func initialModel(cfg config) model {
 		styleTime:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#5B8", Dark: "#5B8"}),
 		stylePath:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#58F", Dark: "#8AD"}),
 		styleText:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#111", Dark: "#DDD"}),
+		styleInfo:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#222", Dark: "#DDD"}),
+		styleWarn:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#C77D00", Dark: "#FFB020"}),
+		styleError: lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#C00000", Dark: "#FF6B6B"}),
 		cfg:        cfg,
 		flushEvery: 80 * time.Millisecond,
 		pending:    make(map[string]*pendingGroup),
@@ -120,6 +133,10 @@ func initialModel(cfg config) model {
 		expandAll:  false,
 		entriesCap: max(1, cfg.maxLines),
 	}
+	// Compile highlight regexes (case-insensitive word boundaries where applicable)
+	m.reErr = regexp.MustCompile(`(?i)\b(error|failed|fail|panic|fatal|exception)\b`)
+	m.reWarn = regexp.MustCompile(`(?i)\b(warn|warning|degrad|slow|timeout)\b`)
+	m.reInfo = regexp.MustCompile(`(?i)\b(info|started|listening|ready)\b`)
 	// Initial info lines
 	abs, _ := filepath.Abs(cfg.rootDir)
 	pat := strings.Join(cfg.patterns, ", ")
@@ -129,6 +146,9 @@ func initialModel(cfg config) model {
 	}
 	banner := fmt.Sprintf("logwat - watching: %s (recursive: %s, pattern: %s). Press Ctrl+C or q to quit", abs, rec, pat)
 	m.appendEntryWithDedup(entry{when: time.Now(), rel: "info", lines: []string{banner}})
+	// Legend
+	legend := "Legend: " + m.styleInfo.Render("INFO") + "  " + m.styleWarn.Render("WARN") + "  " + m.styleError.Render("ERROR")
+	m.appendEntryWithDedup(entry{when: time.Now(), rel: "info", lines: []string{legend}})
 	return m
 }
 
@@ -180,7 +200,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// Error as its own entry (eligible for dedup)
 			errText := m.styleText.Foreground(lipgloss.Color("#ff6b6b")).Render(msg.Error())
-			m.appendEntryWithDedup(entry{when: t, rel: "error", lines: []string{errText}})
+			m.appendEntryWithDedup(entry{when: t, rel: "error", lines: []string{errText}, sev: SevError})
 			m.flushDue = true
 			return m, tea.Tick(m.flushEvery, func(time.Time) tea.Msg { return flushMsg{} })
 		}
@@ -231,11 +251,11 @@ func (m *model) formatLine(l logLine) string {
 	if isCont {
 		// Continuation: indent under text column; no timestamp/path
 		indent := strings.Repeat(" ", len(tsRaw)+1+m.pathColWidth+2)
-		return indent + m.styleText.Render(text)
+		return indent + m.applySeverityStyle(text, m.detectSeverity(text))
 	}
 
 	// Primary line: columns separated by two spaces
-	return ts + " " + pStyled + "  " + m.styleText.Render(text)
+	return ts + " " + pStyled + "  " + m.applySeverityStyle(text, m.detectSeverity(text))
 }
 
 // isContinuation returns true if a line looks like a continuation of the previous entry
@@ -259,6 +279,177 @@ func displayWidth(s string) int {
 	return lipgloss.Width(stripANSI(s))
 }
 
+// --- Highlighting & severity ---
+
+// severity represents the detected severity of a log line
+type severity int
+
+const (
+	SevNone severity = iota
+	SevInfo
+	SevWarn
+	SevError
+)
+
+// detectSeverity determines severity based on regex patterns and simple heuristics.
+// Precedence: ERROR > WARN > INFO.
+func (m *model) detectSeverity(text string) severity {
+	// If regexes are not set (shouldn't happen), default to none
+	if m.reErr != nil && m.reErr.MatchString(text) {
+		return SevError
+	}
+	if m.reWarn != nil && m.reWarn.MatchString(text) {
+		return SevWarn
+	}
+	if m.reInfo != nil && m.reInfo.MatchString(text) {
+		return SevInfo
+	}
+	return SevNone
+}
+
+// applySeverityStyle colors the whole line by severity and highlights keywords.
+func (m *model) applySeverityStyle(text string, sev severity) string {
+	base := m.styleText
+	switch sev {
+	case SevError:
+		base = m.styleError
+	case SevWarn:
+		base = m.styleWarn
+	case SevInfo:
+		base = m.styleInfo
+	default:
+		// keep default text style
+	}
+	// Emphasize matched tokens within the chosen color by bolding them
+	emphasized := text
+	if sev == SevError && m.reErr != nil {
+		bold := m.styleError.Bold(true)
+		emphasized = m.reErr.ReplaceAllStringFunc(emphasized, func(s string) string { return bold.Render(s) })
+	} else if sev == SevWarn && m.reWarn != nil {
+		bold := m.styleWarn.Bold(true)
+		emphasized = m.reWarn.ReplaceAllStringFunc(emphasized, func(s string) string { return bold.Render(s) })
+	} else if sev == SevInfo && m.reInfo != nil {
+		bold := m.styleInfo.Bold(true)
+		emphasized = m.reInfo.ReplaceAllStringFunc(emphasized, func(s string) string { return bold.Render(s) })
+	}
+	return base.Render(emphasized)
+}
+
+// normalizeLine performs a fast-path JSON parse to extract level/msg/ts.
+// It returns possibly updated timestamp, normalized text, and severity.
+func (m *model) normalizeLine(when time.Time, text string) (time.Time, string, severity) {
+	s := strings.TrimSpace(text)
+	if len(s) >= 2 && len(s) <= 10*1024 && s[0] == '{' && s[len(s)-1] == '}' {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(s), &obj); err == nil {
+			// level
+			sev := SevNone
+			if lvl, ok := pickString(obj, "level", "lvl", "severity", "log.level", "lv"); ok {
+				sev = levelToSeverity(lvl)
+			}
+			// message
+			msg := text
+			if mstr, ok := pickString(obj, "msg", "message", "log", "message_text"); ok && mstr != "" {
+				msg = mstr
+			}
+			// timestamp
+			t := when
+			if v, ok := obj["ts"]; ok {
+				if tt, ok := parseAnyTime(v); ok {
+					t = tt
+				}
+			} else if v, ok := obj["time"]; ok {
+				if tt, ok := parseAnyTime(v); ok {
+					t = tt
+				}
+			} else if v, ok := obj["timestamp"]; ok {
+				if tt, ok := parseAnyTime(v); ok {
+					t = tt
+				}
+			}
+			if sev == SevNone {
+				sev = m.detectSeverity(msg)
+			}
+			return t, msg, sev
+		}
+	}
+	// Fallback: severity by regex
+	return when, text, m.detectSeverity(text)
+}
+
+// pickString returns the first string value found for provided keys.
+func pickString(m map[string]any, keys ...string) (string, bool) {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			switch vv := v.(type) {
+			case string:
+				return vv, true
+			case fmt.Stringer:
+				return vv.String(), true
+			}
+		}
+	}
+	return "", false
+}
+
+// levelToSeverity maps common level strings to severity
+func levelToSeverity(level string) severity {
+	l := strings.ToLower(strings.TrimSpace(level))
+	switch l {
+	case "error", "err", "fatal", "panic", "crit", "critical", "severe":
+		return SevError
+	case "warn", "warning":
+		return SevWarn
+	case "info", "information", "notice":
+		return SevInfo
+	default:
+		return SevNone
+	}
+}
+
+// parseAnyTime tries a few common formats or numbers (unix seconds/millis)
+func parseAnyTime(v any) (time.Time, bool) {
+	switch t := v.(type) {
+	case string:
+		s := strings.TrimSpace(t)
+		// RFC3339
+		if tt, err := time.Parse(time.RFC3339Nano, s); err == nil {
+			return tt, true
+		}
+		if tt, err := time.Parse(time.RFC3339, s); err == nil {
+			return tt, true
+		}
+		// Common logfmt ts like 2006-01-02 15:04:05
+		if tt, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+			return tt, true
+		}
+		// Try to parse as integer
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return epochToTime(n)
+		}
+	case float64:
+		// JSON numbers decode to float64
+		n := int64(t)
+		return epochToTime(n)
+	case int64:
+		return epochToTime(t)
+	case int:
+		return epochToTime(int64(t))
+	}
+	return time.Time{}, false
+}
+
+func epochToTime(n int64) (time.Time, bool) {
+	// Heuristic: if too big, assume milliseconds
+	if n > 1_000_000_000_000 {
+		return time.Unix(0, n*int64(time.Millisecond)), true
+	}
+	if n > 3_000_000_000 { // seconds but in the future? still accept
+		return time.Unix(n/1000, (n%1000)*int64(time.Millisecond)), true
+	}
+	return time.Unix(n, 0), true
+}
+
 // --- Grouping & entries ---
 
 type pendingGroup struct {
@@ -266,6 +457,7 @@ type pendingGroup struct {
 	rel    string
 	lines  []string // first line at index 0
 	lastAt time.Time
+	sev    severity
 }
 
 type entry struct {
@@ -273,6 +465,7 @@ type entry struct {
 	rel      string
 	lines    []string // first line + continuations
 	dupCount int      // number of extra duplicates beyond the first
+	sev      severity
 }
 
 func (m *model) ingestLogLine(l logLine) {
@@ -282,7 +475,8 @@ func (m *model) ingestLogLine(l logLine) {
 	if cont {
 		if pg == nil {
 			// treat as its own primary when no pending exists
-			m.pending[l.rel] = &pendingGroup{when: l.when, rel: l.rel, lines: []string{text}, lastAt: time.Now()}
+			sev := m.detectSeverity(text)
+			m.pending[l.rel] = &pendingGroup{when: l.when, rel: l.rel, lines: []string{text}, lastAt: time.Now(), sev: sev}
 		} else {
 			pg.lines = append(pg.lines, text)
 			pg.lastAt = time.Now()
@@ -294,8 +488,10 @@ func (m *model) ingestLogLine(l logLine) {
 		m.emitGroup(*pg)
 		delete(m.pending, l.rel)
 	}
+	// Normalize/parse JSON fast-path for primary lines
+	normWhen, normText, sev := m.normalizeLine(l.when, text)
 	// start new group
-	m.pending[l.rel] = &pendingGroup{when: l.when, rel: l.rel, lines: []string{text}, lastAt: time.Now()}
+	m.pending[l.rel] = &pendingGroup{when: normWhen, rel: l.rel, lines: []string{normText}, lastAt: time.Now(), sev: sev}
 }
 
 func (m *model) flushIdleGroups() {
@@ -319,7 +515,7 @@ func (m *model) emitAllPending() {
 }
 
 func (m *model) emitGroup(pg pendingGroup) {
-	m.appendEntryWithDedup(entry{when: pg.when, rel: pg.rel, lines: append([]string{}, pg.lines...)})
+	m.appendEntryWithDedup(entry{when: pg.when, rel: pg.rel, lines: append([]string{}, pg.lines...), sev: pg.sev})
 }
 
 func (m *model) entryKeyNoTS(e entry) string {
@@ -381,10 +577,10 @@ func (m *model) rebuildViewport() {
 				continue
 			}
 			// first line
-			out = append(out, m.renderPrimaryLine(e.when, e.rel, e.lines[0], e.dupCount))
+			out = append(out, m.renderPrimaryLine(e.when, e.rel, e.lines[0], e.dupCount, e.sev))
 			// continuations
 			for j := 1; j < len(e.lines); j++ {
-				out = append(out, m.renderContinuationLine(e.when, e.lines[j]))
+				out = append(out, m.renderContinuationLine(e.when, e.lines[j], e.sev))
 			}
 		} else {
 			// collapsed: only first line with indication
@@ -393,13 +589,13 @@ func (m *model) rebuildViewport() {
 			if more > 0 {
 				first = fmt.Sprintf("%s  [+%d more]", first, more)
 			}
-			out = append(out, m.renderPrimaryLine(e.when, e.rel, first, e.dupCount))
+			out = append(out, m.renderPrimaryLine(e.when, e.rel, first, e.dupCount, e.sev))
 		}
 	}
 	m.vp.SetContent(strings.Join(out, "\n"))
 }
 
-func (m *model) renderPrimaryLine(t time.Time, rel, text string, dup int) string {
+func (m *model) renderPrimaryLine(t time.Time, rel, text string, dup int, sev severity) string {
 	if m.cfg.utc {
 		t = t.UTC()
 	}
@@ -422,16 +618,16 @@ func (m *model) renderPrimaryLine(t time.Time, rel, text string, dup int) string
 	if dup > 0 {
 		text = fmt.Sprintf("%s (x%d)", text, dup+1)
 	}
-	return ts + " " + pStyled + "  " + m.styleText.Render(text)
+	return ts + " " + pStyled + "  " + m.applySeverityStyle(text, sev)
 }
 
-func (m *model) renderContinuationLine(t time.Time, text string) string {
+func (m *model) renderContinuationLine(t time.Time, text string, sev severity) string {
 	if m.cfg.utc {
 		t = t.UTC()
 	}
 	tsRaw := t.Format("02.01.2006 15:04:05")
 	indent := strings.Repeat(" ", len(tsRaw)+1+m.pathColWidth+2)
-	return indent + m.styleText.Render(text)
+	return indent + m.applySeverityStyle(text, sev)
 }
 
 // ringBuf is a fixed-capacity ring buffer for strings
