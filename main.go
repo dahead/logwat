@@ -21,7 +21,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -30,13 +29,13 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fsnotify/fsnotify"
+	"logwat/platform"
 )
 
 // small generic-less helper (Go 1.20 compatible) used for capacities
@@ -1500,7 +1499,7 @@ func collectDirs(root string, recursive bool) ([]string, error) {
 func primeOffsets(root string, cfg config, state *tailState) {
 	for _, f := range listMatchingFiles(root, cfg) {
 		if fi, err := os.Stat(f); err == nil {
-			ino, dev := inodeDev(fi)
+			ino, dev := platform.InodeDev(fi)
 			state.setOffset(f, ino, dev, fi.Size())
 		}
 	}
@@ -1557,7 +1556,7 @@ func readNewLines(ctx context.Context, path, root string, cfg config, state *tai
 	if err != nil {
 		return err
 	}
-	ino, dev := inodeDev(fi)
+	ino, dev := platform.InodeDev(fi)
 	start := state.getOffset(path, ino, dev, fi.Size())
 
 	if _, err := f.Seek(start, io.SeekStart); err != nil {
@@ -1600,15 +1599,7 @@ func readNewLines(ctx context.Context, path, root string, cfg config, state *tai
 
 // inodeDev returns inode and device id for Linux/Unix platforms; on unsupported
 // systems it returns zeros, which will degrade to path-only tracking.
-func inodeDev(fi os.FileInfo) (uint64, uint64) {
-	if fi == nil {
-		return 0, 0
-	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-		return st.Ino, st.Dev
-	}
-	return 0, 0
-}
+// inodeDev is implemented per-OS in separate files via build tags.
 
 func fileMatches(root, absPath string, cfg config) bool {
 	rel, err := filepath.Rel(root, absPath)
@@ -1796,9 +1787,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle OS signals for graceful shutdown
+	// Handle OS signals for graceful shutdown (OS-specific implementation)
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	platform.NotifySignals(sigCh)
 	go func() {
 		<-sigCh
 		cancel()
