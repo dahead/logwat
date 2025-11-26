@@ -35,6 +35,14 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// small generic-less helper (Go 1.20 compatible) used for capacities
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 type config struct {
 	rootDir   string
 	patterns  []string // multiple globs, e.g. *.log,*.txt
@@ -69,7 +77,6 @@ func (t *tailState) set(p string, off int64) {
 
 type model struct {
 	vp           viewport.Model
-	lines        *ringBuf
 	styleTime    lipgloss.Style
 	stylePath    lipgloss.Style
 	styleText    lipgloss.Style
@@ -78,6 +85,19 @@ type model struct {
 	flushDue     bool
 	flushEvery   time.Duration
 	pathColWidth int
+
+	// Grouping & entries
+	pending   map[string]*pendingGroup // key: relative path
+	groupIdle time.Duration            // flush pending after idle
+	expandAll bool                     // toggle expansion of groups
+
+	// ring buffer of structured entries for rendering
+	entriesCap  int
+	entries     []entry
+	entriesHead int
+	entriesSize int
+	// dedup tracking (ignoring timestamp): last emitted key and count
+	lastKeyNoTS string
 }
 
 type (
@@ -90,12 +110,15 @@ func initialModel(cfg config) model {
 	vp := viewport.New(0, 0)
 	m := model{
 		vp:         vp,
-		lines:      newRingBuf(max(1, cfg.maxLines)),
 		styleTime:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#5B8", Dark: "#5B8"}),
 		stylePath:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#58F", Dark: "#8AD"}),
 		styleText:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#111", Dark: "#DDD"}),
 		cfg:        cfg,
 		flushEvery: 80 * time.Millisecond,
+		pending:    make(map[string]*pendingGroup),
+		groupIdle:  350 * time.Millisecond,
+		expandAll:  false,
+		entriesCap: max(1, cfg.maxLines),
 	}
 	// Initial info lines
 	abs, _ := filepath.Abs(cfg.rootDir)
@@ -105,7 +128,7 @@ func initialModel(cfg config) model {
 		rec = "yes"
 	}
 	banner := fmt.Sprintf("logwat - watching: %s (recursive: %s, pattern: %s). Press Ctrl+C or q to quit", abs, rec, pat)
-	m.lines.append(m.styleText.Render(banner))
+	m.appendEntryWithDedup(entry{when: time.Now(), rel: "info", lines: []string{banner}})
 	return m
 }
 
@@ -116,26 +139,33 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.vp.Width = msg.Width
 		m.vp.Height = msg.Height
-		m.vp.SetContent(strings.Join(m.lines.slice(), "\n"))
+		m.rebuildViewport()
 		return m, nil
 	case tea.KeyMsg:
 		// Allow quitting with Ctrl+C or 'q'
 		if msg.Type == tea.KeyCtrlC || msg.String() == "q" {
 			return m, tea.Quit
 		}
+		if msg.String() == "e" {
+			// toggle expand/collapse of grouped entries
+			m.expandAll = !m.expandAll
+			m.rebuildViewport()
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.vp, cmd = m.vp.Update(msg)
 		return m, cmd
 	case logLineMsg:
 		l := logLine(msg)
-		// Append formatted line or continuation
-		m.lines.append(m.formatLine(l))
+		m.ingestLogLine(l)
 		// Schedule a debounced flush to the viewport
 		m.flushDue = true
 		return m, tea.Tick(m.flushEvery, func(time.Time) tea.Msg { return flushMsg{} })
 	case flushMsg:
 		if m.flushDue {
-			m.vp.SetContent(strings.Join(m.lines.slice(), "\n"))
+			// Flush any idle pending groups
+			m.flushIdleGroups()
+			m.rebuildViewport()
 			m.vp.GotoBottom()
 			m.flushDue = false
 		}
@@ -148,26 +178,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cfg.utc {
 				t = t.UTC()
 			}
-			tsRaw := t.Format("02.01.2006 15:04:05")
-			ts := m.styleTime.Render(tsRaw)
-
-			// Path column labeled as "error" and padded to the current width
-			pathLabel := "error"
-			w := displayWidth(stripANSI(pathLabel))
-			if w > m.pathColWidth {
-				m.pathColWidth = w
-			}
-			pad := m.pathColWidth - w
-			if pad < 0 {
-				pad = 0
-			}
-			paddedPath := pathLabel + strings.Repeat(" ", pad)
-			pStyled := m.stylePath.Render(paddedPath)
-
-			// Error text in red
-			errStyle := m.styleText.Foreground(lipgloss.Color("#ff6b6b"))
-			line := ts + " " + pStyled + "  " + errStyle.Render(msg.Error())
-			m.lines.append(line)
+			// Error as its own entry (eligible for dedup)
+			errText := m.styleText.Foreground(lipgloss.Color("#ff6b6b")).Render(msg.Error())
+			m.appendEntryWithDedup(entry{when: t, rel: "error", lines: []string{errText}})
 			m.flushDue = true
 			return m, tea.Tick(m.flushEvery, func(time.Time) tea.Msg { return flushMsg{} })
 		}
@@ -184,6 +197,7 @@ func (m *model) View() string {
 	return m.vp.View()
 }
 
+// formatLine renders a single line in the 3-column layout. Used when expanding groups.
 func (m *model) formatLine(l logLine) string {
 	// Normalize line breaks and strip trailing CR
 	text := strings.ReplaceAll(l.text, "\r", "")
@@ -243,6 +257,181 @@ func stripANSI(s string) string {
 // displayWidth returns the printable width, ignoring ANSI
 func displayWidth(s string) int {
 	return lipgloss.Width(stripANSI(s))
+}
+
+// --- Grouping & entries ---
+
+type pendingGroup struct {
+	when   time.Time
+	rel    string
+	lines  []string // first line at index 0
+	lastAt time.Time
+}
+
+type entry struct {
+	when     time.Time
+	rel      string
+	lines    []string // first line + continuations
+	dupCount int      // number of extra duplicates beyond the first
+}
+
+func (m *model) ingestLogLine(l logLine) {
+	text := strings.ReplaceAll(l.text, "\r", "")
+	cont := isContinuation(text)
+	pg := m.pending[l.rel]
+	if cont {
+		if pg == nil {
+			// treat as its own primary when no pending exists
+			m.pending[l.rel] = &pendingGroup{when: l.when, rel: l.rel, lines: []string{text}, lastAt: time.Now()}
+		} else {
+			pg.lines = append(pg.lines, text)
+			pg.lastAt = time.Now()
+		}
+		return
+	}
+	// primary line: emit previous pending for this path
+	if pg != nil {
+		m.emitGroup(*pg)
+		delete(m.pending, l.rel)
+	}
+	// start new group
+	m.pending[l.rel] = &pendingGroup{when: l.when, rel: l.rel, lines: []string{text}, lastAt: time.Now()}
+}
+
+func (m *model) flushIdleGroups() {
+	if m.groupIdle <= 0 {
+		return
+	}
+	now := time.Now()
+	for rel, pg := range m.pending {
+		if now.Sub(pg.lastAt) >= m.groupIdle {
+			m.emitGroup(*pg)
+			delete(m.pending, rel)
+		}
+	}
+}
+
+func (m *model) emitAllPending() {
+	for rel, pg := range m.pending {
+		m.emitGroup(*pg)
+		delete(m.pending, rel)
+	}
+}
+
+func (m *model) emitGroup(pg pendingGroup) {
+	m.appendEntryWithDedup(entry{when: pg.when, rel: pg.rel, lines: append([]string{}, pg.lines...)})
+}
+
+func (m *model) entryKeyNoTS(e entry) string {
+	// Use rel + lines to define identical entry ignoring timestamps
+	return e.rel + "\n" + strings.Join(e.lines, "\n")
+}
+
+func (m *model) appendEntryWithDedup(e entry) {
+	key := m.entryKeyNoTS(e)
+	// Check last entry for dedup
+	if m.entriesSize > 0 {
+		last := m.entriesGet(m.entriesSize - 1)
+		if m.entryKeyNoTS(last) == key {
+			last.dupCount++
+			m.entriesSet(m.entriesSize-1, last)
+			return
+		}
+	}
+	m.entriesPush(e)
+}
+
+func (m *model) entriesPush(e entry) {
+	cap := m.entriesCap
+	if cap <= 0 {
+		return
+	}
+	if len(m.entries) == 0 {
+		m.entries = make([]entry, cap)
+	}
+	idx := (m.entriesHead + m.entriesSize) % cap
+	m.entries[idx] = e
+	if m.entriesSize < cap {
+		m.entriesSize++
+	} else {
+		m.entriesHead = (m.entriesHead + 1) % cap
+	}
+}
+
+func (m *model) entriesGet(i int) entry {
+	idx := (m.entriesHead + i) % m.entriesCap
+	return m.entries[idx]
+}
+
+func (m *model) entriesSet(i int, e entry) {
+	idx := (m.entriesHead + i) % m.entriesCap
+	m.entries[idx] = e
+}
+
+func (m *model) rebuildViewport() {
+	// Re-render the content from structured entries
+	var out []string
+	m.pathColWidth = m.pathColWidth // preserved across renders
+	for i := 0; i < m.entriesSize; i++ {
+		e := m.entriesGet(i)
+		// render entry according to expandAll
+		if m.expandAll || len(e.lines) == 0 || len(e.lines) == 1 {
+			// expanded: render first as primary, rest as continuations
+			if len(e.lines) == 0 {
+				continue
+			}
+			// first line
+			out = append(out, m.renderPrimaryLine(e.when, e.rel, e.lines[0], e.dupCount))
+			// continuations
+			for j := 1; j < len(e.lines); j++ {
+				out = append(out, m.renderContinuationLine(e.when, e.lines[j]))
+			}
+		} else {
+			// collapsed: only first line with indication
+			first := e.lines[0]
+			more := len(e.lines) - 1
+			if more > 0 {
+				first = fmt.Sprintf("%s  [+%d more]", first, more)
+			}
+			out = append(out, m.renderPrimaryLine(e.when, e.rel, first, e.dupCount))
+		}
+	}
+	m.vp.SetContent(strings.Join(out, "\n"))
+}
+
+func (m *model) renderPrimaryLine(t time.Time, rel, text string, dup int) string {
+	if m.cfg.utc {
+		t = t.UTC()
+	}
+	tsRaw := t.Format("02.01.2006 15:04:05")
+	ts := m.styleTime.Render(tsRaw)
+
+	// Path column with fixed width padding
+	p := rel
+	w := displayWidth(stripANSI(p))
+	if w > m.pathColWidth {
+		m.pathColWidth = w
+	}
+	pad := m.pathColWidth - w
+	if pad < 0 {
+		pad = 0
+	}
+	paddedPath := p + strings.Repeat(" ", pad)
+	pStyled := m.stylePath.Render(paddedPath)
+
+	if dup > 0 {
+		text = fmt.Sprintf("%s (x%d)", text, dup+1)
+	}
+	return ts + " " + pStyled + "  " + m.styleText.Render(text)
+}
+
+func (m *model) renderContinuationLine(t time.Time, text string) string {
+	if m.cfg.utc {
+		t = t.UTC()
+	}
+	tsRaw := t.Format("02.01.2006 15:04:05")
+	indent := strings.Repeat(" ", len(tsRaw)+1+m.pathColWidth+2)
+	return indent + m.styleText.Render(text)
 }
 
 // ringBuf is a fixed-capacity ring buffer for strings
