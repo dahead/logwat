@@ -51,6 +51,10 @@ type config struct {
 	recursive bool
 	maxLines  int
 	utc       bool
+	// include/exclude globs evaluated against relative path first; if empty,
+	// include defaults to patterns or ["*.log","*.txt"]. Excludes override includes.
+	include []string
+	exclude []string
 }
 
 type logLine struct {
@@ -131,6 +135,18 @@ type model struct {
 	reErr  *regexp.Regexp
 	reWarn *regexp.Regexp
 	reInfo *regexp.Regexp
+
+	// --- Filtering & Search ---
+	filterEditing bool           // when true, capture keystrokes into filterEdit
+	filterEdit    string         // current edit buffer
+	filterActive  string         // applied filter string (substring or regex literal)
+	filterIsRegex bool           // true if filterActive is a valid regex
+	filterRe      *regexp.Regexp // compiled regex when filterIsRegex
+	filterErr     string         // last regex compile error (for header)
+
+	visibleLines  []string // last rendered, after filtering
+	matchLineIdxs []int    // line indices in visibleLines matching search
+	curMatch      int      // current selected match index in matchLineIdxs
 }
 
 type (
@@ -167,7 +183,7 @@ func initialModel(cfg config) model {
 	if cfg.recursive {
 		rec = "yes"
 	}
-	banner := fmt.Sprintf("logwat - watching: %s (recursive: %s, pattern: %s). Press Ctrl+C or q to quit", abs, rec, pat)
+	banner := fmt.Sprintf("logwat - watching: %s (recursive: %s, pattern: %s). Keys: / filter, Enter apply, Esc clear, n/N next/prev, e expand, q quit", abs, rec, pat)
 	m.appendEntryWithDedup(entry{when: time.Now(), rel: "info", lines: []string{banner}})
 	// Legend
 	legend := "Legend: " + m.styleInfo.Render("INFO") + "  " + m.styleWarn.Render("WARN") + "  " + m.styleError.Render("ERROR")
@@ -181,7 +197,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.vp.Width = msg.Width
-		m.vp.Height = msg.Height
+		// Reserve one line for header
+		h := msg.Height - 1
+		if h < 1 {
+			h = 1
+		}
+		m.vp.Height = h
 		m.rebuildViewport()
 		return m, nil
 	case tea.KeyMsg:
@@ -189,11 +210,80 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyCtrlC || msg.String() == "q" {
 			return m, tea.Quit
 		}
+		// Filter input mode handling
+		if m.filterEditing {
+			switch msg.Type {
+			case tea.KeyEnter:
+				// Apply filter
+				m.applyFilter(m.filterEdit)
+				m.filterEditing = false
+				m.rebuildViewport()
+				return m, nil
+			case tea.KeyEsc:
+				// Clear filter and exit editing
+				m.filterEdit = ""
+				m.applyFilter("")
+				m.filterEditing = false
+				m.rebuildViewport()
+				return m, nil
+			case tea.KeyBackspace:
+				if len(m.filterEdit) > 0 {
+					m.filterEdit = m.filterEdit[:len(m.filterEdit)-1]
+					// live update
+					m.applyFilter(m.filterEdit)
+					m.rebuildViewport()
+				}
+				return m, nil
+			default:
+				s := msg.String()
+				if s == "backspace" { // handle alternate backspace code on some terms
+					if len(m.filterEdit) > 0 {
+						m.filterEdit = m.filterEdit[:len(m.filterEdit)-1]
+						m.applyFilter(m.filterEdit)
+						m.rebuildViewport()
+					}
+					return m, nil
+				}
+				// Ignore control keys that produce names like "up", "down", etc.
+				if len(s) == 1 && s != "\x1b" {
+					m.filterEdit += s
+					// live update
+					m.applyFilter(m.filterEdit)
+					m.rebuildViewport()
+				}
+				return m, nil
+			}
+		}
 		if msg.String() == "e" {
 			// toggle expand/collapse of grouped entries
 			m.expandAll = !m.expandAll
 			m.rebuildViewport()
 			return m, nil
+		}
+		if msg.String() == "/" { // start filter editing
+			m.filterEditing = true
+			// start with current active as base
+			m.filterEdit = m.filterActive
+			return m, nil
+		}
+		if msg.String() == "n" || msg.String() == "N" {
+			if len(m.matchLineIdxs) > 0 {
+				if msg.String() == "n" {
+					m.curMatch = (m.curMatch + 1) % len(m.matchLineIdxs)
+				} else {
+					m.curMatch = (m.curMatch - 1 + len(m.matchLineIdxs)) % len(m.matchLineIdxs)
+				}
+				// scroll to the selected line
+				line := m.matchLineIdxs[m.curMatch]
+				// Move viewport to show that line roughly at top
+				if line >= 0 {
+					// Estimate YOffset bounds; clamp within content height
+					m.vp.GotoTop()
+					// viewport has methods to set YOffset via SetYOffset in newer versions; fallback by scrolling
+					m.vp.SetYOffset(line)
+				}
+				return m, nil
+			}
 		}
 		var cmd tea.Cmd
 		m.vp, cmd = m.vp.Update(msg)
@@ -236,8 +326,25 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) View() string {
-	// Errors are appended as lines; do not replace the view
-	return m.vp.View()
+	// Add a small header with filter/search status
+	header := ""
+	if m.filterEditing {
+		header = "/" + m.filterEdit
+	} else if m.filterActive != "" {
+		mode := "substr"
+		if m.filterIsRegex {
+			mode = "regex"
+		}
+		header = fmt.Sprintf("filter(%s): %q  matches: %d", mode, m.filterActive, len(m.matchLineIdxs))
+		if m.filterErr != "" {
+			header += "  err: " + m.filterErr
+		}
+	} else {
+		header = "Press / to filter, n/N to navigate matches, e to expand, q to quit"
+	}
+	hdr := m.styleInfo.Render(header)
+	content := m.vp.View()
+	return hdr + "\n" + content
 }
 
 // formatLine renders a single line in the 3-column layout. Used when expanding groups.
@@ -593,6 +700,8 @@ func (m *model) rebuildViewport() {
 	m.pathColWidth = m.pathColWidth // preserved across renders
 	for i := 0; i < m.entriesSize; i++ {
 		e := m.entriesGet(i)
+		// Apply entry-level filtering: if filter is active and collapsed, we include entry
+		// only if any of its lines match; in expanded mode we'll check per line below.
 		// render entry according to expandAll
 		if m.expandAll || len(e.lines) == 0 || len(e.lines) == 1 {
 			// expanded: render first as primary, rest as continuations
@@ -600,10 +709,14 @@ func (m *model) rebuildViewport() {
 				continue
 			}
 			// first line
-			out = append(out, m.renderPrimaryLine(e.when, e.rel, e.lines[0], e.dupCount, e.sev))
+			if m.linePassesFilter(e.rel, e.lines[0]) {
+				out = append(out, m.renderPrimaryLine(e.when, e.rel, e.lines[0], e.dupCount, e.sev))
+			}
 			// continuations
 			for j := 1; j < len(e.lines); j++ {
-				out = append(out, m.renderContinuationLine(e.when, e.lines[j], e.sev))
+				if m.linePassesFilter(e.rel, e.lines[j]) {
+					out = append(out, m.renderContinuationLine(e.when, e.lines[j], e.sev))
+				}
 			}
 		} else {
 			// collapsed: only first line with indication
@@ -612,10 +725,128 @@ func (m *model) rebuildViewport() {
 			if more > 0 {
 				first = fmt.Sprintf("%s  [+%d more]", first, more)
 			}
-			out = append(out, m.renderPrimaryLine(e.when, e.rel, first, e.dupCount, e.sev))
+			// include entry if any of its lines match
+			if m.entryPassesFilter(e) {
+				out = append(out, m.renderPrimaryLine(e.when, e.rel, first, e.dupCount, e.sev))
+			}
 		}
 	}
-	m.vp.SetContent(strings.Join(out, "\n"))
+	// compute search matches and highlight them if filterActive present
+	m.visibleLines = out
+	m.computeMatches()
+	highlighted := make([]string, len(m.visibleLines))
+	for i, ln := range m.visibleLines {
+		highlighted[i] = m.highlightMatches(ln)
+	}
+	m.vp.SetContent(strings.Join(highlighted, "\n"))
+}
+
+// linePassesFilter returns true if no filter is active or the pair rel|text passes the filter
+func (m *model) linePassesFilter(rel, text string) bool {
+	if m.filterActive == "" {
+		return true
+	}
+	hay := rel + "\t" + text
+	if m.filterIsRegex && m.filterRe != nil {
+		return m.filterRe.MatchString(hay)
+	}
+	// substring (case-insensitive)
+	return strings.Contains(strings.ToLower(hay), strings.ToLower(m.filterActive))
+}
+
+func (m *model) entryPassesFilter(e entry) bool {
+	if m.filterActive == "" {
+		return true
+	}
+	for _, ln := range e.lines {
+		if m.linePassesFilter(e.rel, ln) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *model) applyFilter(s string) {
+	m.filterActive = s
+	m.filterErr = ""
+	m.filterIsRegex = false
+	m.filterRe = nil
+	// Regex mode when starts and ends with '/'
+	if len(s) >= 2 && strings.HasPrefix(s, "/") && strings.HasSuffix(s, "/") {
+		pat := s[1 : len(s)-1]
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			m.filterErr = err.Error()
+		} else {
+			m.filterIsRegex = true
+			m.filterRe = re
+		}
+	}
+	// reset match navigation
+	m.curMatch = 0
+}
+
+func (m *model) computeMatches() {
+	m.matchLineIdxs = m.matchLineIdxs[:0]
+	if m.filterActive == "" || len(m.visibleLines) == 0 {
+		return
+	}
+	for i, ln := range m.visibleLines {
+		if m.matchLine(ln) {
+			m.matchLineIdxs = append(m.matchLineIdxs, i)
+		}
+	}
+	if m.curMatch >= len(m.matchLineIdxs) {
+		m.curMatch = 0
+	}
+}
+
+func (m *model) matchLine(line string) bool {
+	if m.filterActive == "" {
+		return false
+	}
+	// match on the rendered line (including styles stripped for search)
+	plain := stripANSI(line)
+	if m.filterIsRegex && m.filterRe != nil {
+		return m.filterRe.MatchString(plain)
+	}
+	return strings.Contains(strings.ToLower(plain), strings.ToLower(m.filterActive))
+}
+
+func (m *model) highlightMatches(line string) string {
+	if m.filterActive == "" {
+		return line
+	}
+	// naive highlighting on plain text, then re-apply by replacing segments in the original
+	// Since ANSI already present, we will apply a simple regex to the raw string; this is not perfect
+	style := lipgloss.NewStyle().Reverse(true)
+	if m.filterIsRegex && m.filterRe != nil {
+		return m.filterRe.ReplaceAllStringFunc(line, func(s string) string { return style.Render(s) })
+	}
+	// substring case-insensitive highlight: find all occurrences
+	needle := strings.ToLower(m.filterActive)
+	if needle == "" {
+		return line
+	}
+	// Walk through line and build result
+	var b strings.Builder
+	lower := strings.ToLower(line)
+	i := 0
+	for {
+		j := strings.Index(lower[i:], needle)
+		if j < 0 {
+			b.WriteString(line[i:])
+			break
+		}
+		j += i
+		b.WriteString(line[:j][i:])
+		b.WriteString(style.Render(line[j : j+len(needle)]))
+		i = j + len(needle)
+		if i >= len(line) {
+			break
+		}
+	}
+	return b.String()
 }
 
 func (m *model) renderPrimaryLine(t time.Time, rel, text string, dup int, sev severity) string {
@@ -898,17 +1129,51 @@ func fileMatches(root, absPath string, cfg config) bool {
 		return false
 	}
 
-	if len(cfg.patterns) == 0 {
-		return true
+	// Determine include set: cfg.include if set, else cfg.patterns, else defaults
+	includes := cfg.include
+	if len(includes) == 0 {
+		includes = cfg.patterns
+	}
+	if len(includes) == 0 {
+		includes = []string{"*.log", "*.txt"}
 	}
 
+	// Normalize rel for matching
+	rel = filepath.ToSlash(rel)
 	base := filepath.Base(absPath)
-	for _, pat := range cfg.patterns {
+	matched := false
+	for _, pat := range includes {
+		pat = strings.TrimSpace(pat)
+		if pat == "" {
+			continue
+		}
+		// Try match against rel first, then base
+		if ok, _ := filepath.Match(pat, rel); ok {
+			matched = true
+			break
+		}
 		if ok, _ := filepath.Match(pat, base); ok {
-			return true
+			matched = true
+			break
 		}
 	}
-	return false
+	if !matched {
+		return false
+	}
+	// Excludes: if any matches rel or base, reject
+	for _, pat := range cfg.exclude {
+		pat = strings.TrimSpace(pat)
+		if pat == "" {
+			continue
+		}
+		if ok, _ := filepath.Match(pat, rel); ok {
+			return false
+		}
+		if ok, _ := filepath.Match(pat, base); ok {
+			return false
+		}
+	}
+	return true
 }
 
 func listMatchingFiles(root string, cfg config) []string {
@@ -961,10 +1226,14 @@ func parseArgs() (config, error) {
 	var recursive bool
 	var maxLines int
 	var utc bool
+	var includeArg string
+	var excludeArg string
 	flag.BoolVar(&recursive, "recursive", true, "watch directories recursively")
 	flag.BoolVar(&recursive, "r", true, "watch directories recursively (shorthand)")
 	flag.IntVar(&maxLines, "max-lines", 5000, "maximum lines to retain in the viewport")
 	flag.BoolVar(&utc, "utc", false, "render timestamps in UTC")
+	flag.StringVar(&includeArg, "include", "", "comma-separated include globs (match rel path or base)")
+	flag.StringVar(&excludeArg, "exclude", "", "comma-separated exclude globs (match rel path or base)")
 
 	// Show help if no args
 	if len(os.Args) <= 1 {
@@ -993,7 +1262,22 @@ func parseArgs() (config, error) {
 			}
 		}
 	}
-	if len(cfg.patterns) == 0 {
+	if includeArg != "" {
+		for _, s := range strings.Split(includeArg, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				cfg.include = append(cfg.include, s)
+			}
+		}
+	}
+	if excludeArg != "" {
+		for _, s := range strings.Split(excludeArg, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				cfg.exclude = append(cfg.exclude, s)
+			}
+		}
+	}
+	// patterns remain supported for backward compat and initial banner
+	if len(cfg.patterns) == 0 && len(cfg.include) == 0 {
 		cfg.patterns = []string{"*.log", "*.txt"}
 	}
 	return cfg, nil
@@ -1001,10 +1285,11 @@ func parseArgs() (config, error) {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <directory> [pattern_globs] [--recursive] [--max-lines N] [--utc]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <directory> [pattern_globs] [--recursive] [--max-lines N] [--utc] [--include globs] [--exclude globs]\n", filepath.Base(os.Args[0]))
 		fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
 		fmt.Fprintln(flag.CommandLine.Output(), "  logwat /var/log \"*.log,*.txt\" --recursive --max-lines 10000")
 		fmt.Fprintln(flag.CommandLine.Output(), "  logwat /var/log --utc")
+		fmt.Fprintln(flag.CommandLine.Output(), "  logwat /var/log --include \"**/*.log,*.txt\" --exclude \"**/archive/*,*.bak\"")
 	}
 
 	cfg, err := parseArgs() // Remove the os.Args check from here
