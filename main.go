@@ -3,26 +3,30 @@
 // and colored output.
 //
 // Example calls:
-//   logwat C:\ProgramData\Microsoft\IntuneManagementExtension\Logs *.log --recursive
-//   logwat C:\ProgramData\Microsoft\IntuneManagementExtension\Logs
+//   logwat /var/log *.log --recursive
+//   logwat /var/log
 // Example output:
-// 21.11.2025 10:35:45	intunelogs\sessions.log		[LAST LINE FROM THIS FILE]
-// 21.11.2025 10:35:47	intunelogs\user.log			[LAST LINE FROM THIS FILE]
+// 21.11.2025 10:35:45	intunelogs/sessions.log		[LAST LINE FROM THIS FILE]
+// 21.11.2025 10:35:47	intunelogs/user.log			[LAST LINE FROM THIS FILE]
 
 package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"runtime"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -37,7 +41,6 @@ type config struct {
 	recursive bool
 	maxLines  int
 	utc       bool
-	winPollMs int
 }
 
 type logLine struct {
@@ -47,13 +50,22 @@ type logLine struct {
 }
 
 type tailState struct {
-	mu     sync.Mutex
-	offset map[string]int64
+	offset sync.Map // string -> *atomic.Int64 for lock-free reads
 }
 
-func newTailState() *tailState               { return &tailState{offset: make(map[string]int64)} }
-func (t *tailState) get(p string) int64      { t.mu.Lock(); defer t.mu.Unlock(); return t.offset[p] }
-func (t *tailState) set(p string, off int64) { t.mu.Lock(); t.offset[p] = off; t.mu.Unlock() }
+func newTailState() *tailState { return &tailState{} }
+
+func (t *tailState) get(p string) int64 {
+	if v, ok := t.offset.Load(p); ok {
+		return v.(*atomic.Int64).Load()
+	}
+	return 0
+}
+
+func (t *tailState) set(p string, off int64) {
+	v, _ := t.offset.LoadOrStore(p, &atomic.Int64{})
+	v.(*atomic.Int64).Store(off)
+}
 
 type model struct {
 	vp           viewport.Model
@@ -71,6 +83,7 @@ type model struct {
 type (
 	logLineMsg logLine
 	errMsg     error
+	flushMsg   struct{}
 )
 
 func initialModel(cfg config) model {
@@ -130,7 +143,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		// Append error line instead of replacing view
 		if msg != nil {
-			m.lines.append(m.styleText.Copy().Foreground(lipgloss.Color("#ff6b6b")).Render("[err] " + msg.Error()))
+			errStyle := m.styleText.Foreground(lipgloss.Color("#ff6b6b"))
+			m.lines.append(errStyle.Render("[err] " + msg.Error()))
 			m.flushDue = true
 			return m, tea.Tick(m.flushEvery, func(time.Time) tea.Msg { return flushMsg{} })
 		}
@@ -164,10 +178,6 @@ func (m *model) formatLine(l logLine) string {
 
 	// Path column with fixed width padding
 	p := l.rel
-	if runtime.GOOS == "windows" {
-		// Show Windows-style backslashes
-		p = strings.ReplaceAll(filepath.ToSlash(p), "/", "\\")
-	}
 	// track maximum path width (without style)
 	w := displayWidth(stripANSI(p))
 	if w > m.pathColWidth {
@@ -196,37 +206,15 @@ func isContinuation(s string) bool {
 	if s == "" {
 		return false
 	}
-	ls := strings.ToLower(s)
 	return strings.HasPrefix(s, " ") || strings.HasPrefix(s, "\t") ||
-		strings.HasPrefix(ls, "at ") || strings.HasPrefix(ls, "caused by") ||
 		strings.HasPrefix(s, "...") || strings.HasPrefix(s, "| ")
 }
 
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
 // stripANSI removes ANSI escape sequences
 func stripANSI(s string) string {
-	// simple state machine to drop ESC [ ... m sequences
-	b := make([]rune, 0, len(s))
-	esc := false
-	code := false
-	for _, r := range s {
-		switch {
-		case !esc && r == 0x1b:
-			esc = true
-		case esc && !code && (r == '[' || r == '(' || r == ')'):
-			code = true
-		case esc && code:
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				// end of CSI sequence
-				esc = false
-				code = false
-			}
-		default:
-			if !esc {
-				b = append(b, r)
-			}
-		}
-	}
-	return string(b)
+	return ansiRegex.ReplaceAllString(s, "")
 }
 
 // displayWidth returns the printable width, ignoring ANSI
@@ -266,16 +254,7 @@ func (r *ringBuf) slice() []string {
 	return out
 }
 
-type flushMsg struct{}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func watchAndTail(cfg config, p *tea.Program) error {
+func watchAndTail(ctx context.Context, cfg config, p *tea.Program) error {
 	absRoot, err := filepath.Abs(cfg.rootDir)
 	if err != nil {
 		return err
@@ -285,151 +264,167 @@ func watchAndTail(cfg config, p *tea.Program) error {
 	if err != nil {
 		return err
 	}
+	defer watcher.Close()
 
-	// gather directories
-	dirs := map[string]struct{}{}
-	if cfg.recursive {
-		_ = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
+	// Collect directories to watch
+	dirs, err := collectDirs(absRoot, cfg.recursive)
+	if err != nil {
+		return err
+	}
+
+	for _, d := range dirs {
+		if err := watcher.Add(d); err != nil {
+			p.Send(errMsg(fmt.Errorf("failed to watch %s: %w", d, err)))
+		}
+	}
+
+	state := newTailState()
+	primeOffsets(absRoot, cfg, state)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		handleFsnotifyEvents(ctx, watcher, absRoot, cfg, state, p)
+	}()
+
+	// Wait for context cancellation
+	<-ctx.Done()
+	wg.Wait()
+	return nil
+}
+
+func collectDirs(root string, recursive bool) ([]string, error) {
+	dirs := make(map[string]struct{})
+	if recursive {
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
-				return nil
+				return nil // skip errors
 			}
 			if d.IsDir() {
 				dirs[path] = struct{}{}
 			}
 			return nil
 		})
+		if err != nil {
+			return nil, err
+		}
 	} else {
-		dirs[absRoot] = struct{}{}
+		dirs[root] = struct{}{}
 	}
+
 	dirList := make([]string, 0, len(dirs))
 	for d := range dirs {
 		dirList = append(dirList, d)
 	}
 	sort.Strings(dirList)
-	for _, d := range dirList {
-		_ = watcher.Add(d)
-	}
-
-	state := newTailState()
-
-	// prime offsets so we only output NEW lines from now on
-	prime := func(root string) {
-		for _, f := range listMatchingFiles(root, cfg) {
-			if fi, err := os.Stat(f); err == nil {
-				state.set(f, fi.Size())
-			}
-		}
-	}
-	prime(absRoot)
-
-	// read new data from file and send as messages
-	readNew := func(path string) error {
-		if !fileMatches(absRoot, path, cfg) {
-			return nil
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		start := state.get(path)
-		if fi, err := f.Stat(); err == nil && fi.Size() < start {
-			start = 0
-		}
-		if _, err := f.Seek(start, io.SeekStart); err != nil {
-			return err
-		}
-		r := bufio.NewReader(f)
-		for {
-			line, err := r.ReadString('\n')
-			if len(line) > 0 {
-				rel, _ := filepath.Rel(absRoot, path)
-				rel = filepath.Clean(rel)
-				t := time.Now()
-				if cfg.utc {
-					t = t.UTC()
-				}
-				// keep raw text; formatting will normalize CR later
-				p.Send(logLineMsg{when: t, rel: rel, text: strings.TrimRight(line, "\r\n")})
-			}
-			if errors.Is(err, io.EOF) {
-				if pos, perr := f.Seek(0, io.SeekCurrent); perr == nil {
-					state.set(path, pos)
-				}
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	// fsnotify event loop
-	go func() {
-		for {
-			select {
-			case ev, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				if ev.Has(fsnotify.Create) {
-					// new dir inside tree
-					if fi, err := os.Stat(ev.Name); err == nil && fi.IsDir() {
-						_ = watcher.Add(ev.Name)
-						if cfg.recursive {
-							prime(ev.Name)
-						}
-						continue
-					}
-				}
-				// Treat Chmod as Write on Windows: some tools trigger CHMOD instead of WRITE
-				if ev.Has(fsnotify.Write) || ev.Has(fsnotify.Create) || (runtime.GOOS == "windows" && ev.Has(fsnotify.Chmod)) {
-					_ = readNew(ev.Name)
-				}
-				if ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename) {
-					state.set(ev.Name, 0)
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				p.Send(errMsg(err))
-			}
-		}
-	}()
-
-	// On Windows, some file appends may not reliably emit WRITE events depending on the writer.
-	if runtime.GOOS == "windows" {
-		ms := cfg.winPollMs
-		if ms <= 0 {
-			ms = 700
-		}
-		ticker := time.NewTicker(time.Duration(ms) * time.Millisecond)
-		go func() {
-			for range ticker.C {
-				for _, f := range listMatchingFiles(absRoot, cfg) {
-					_ = readNew(f)
-				}
-			}
-		}()
-	}
-
-	return nil
+	return dirList, nil
 }
 
-func fileMatches(root string, absPath string, cfg config) bool {
+func primeOffsets(root string, cfg config, state *tailState) {
+	for _, f := range listMatchingFiles(root, cfg) {
+		if fi, err := os.Stat(f); err == nil {
+			state.set(f, fi.Size())
+		}
+	}
+}
+
+func handleFsnotifyEvents(ctx context.Context, watcher *fsnotify.Watcher, absRoot string, cfg config, state *tailState, p *tea.Program) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			// fmt.Fprintf(os.Stderr, "DEBUG EVENT: %s %s\n", ev.Op, ev.Name)
+			// Use bitwise operations instead of deprecated .Has()
+			if ev.Op&fsnotify.Create != 0 {
+				if fi, err := os.Stat(ev.Name); err == nil && fi.IsDir() {
+					_ = watcher.Add(ev.Name)
+					if cfg.recursive {
+						primeOffsets(ev.Name, cfg, state)
+					}
+					continue
+				}
+			}
+			if ev.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+				_ = readNewLines(ev.Name, absRoot, cfg, state, p)
+			}
+			if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+				state.set(ev.Name, 0)
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			p.Send(errMsg(err))
+		}
+	}
+}
+
+func readNewLines(path, root string, cfg config, state *tailState, p *tea.Program) error {
+	if !fileMatches(root, path, cfg) {
+		return nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	start := state.get(path)
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	// Handle log rotation (file truncated)
+	if fi.Size() < start {
+		start = 0
+	}
+
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return err
+	}
+
+	rel, _ := filepath.Rel(root, path)
+	rel = filepath.Clean(rel)
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		t := time.Now()
+		if cfg.utc {
+			t = t.UTC()
+		}
+		p.Send(logLineMsg{when: t, rel: rel, text: scanner.Text()})
+	}
+
+	if pos, err := f.Seek(0, io.SeekCurrent); err == nil {
+		state.set(path, pos)
+	}
+
+	return scanner.Err()
+}
+
+func fileMatches(root, absPath string, cfg config) bool {
 	rel, err := filepath.Rel(root, absPath)
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return false
 	}
+
 	fi, err := os.Stat(absPath)
 	if err != nil || fi.IsDir() {
 		return false
 	}
-	base := filepath.Base(absPath)
+
 	if len(cfg.patterns) == 0 {
 		return true
 	}
+
+	base := filepath.Base(absPath)
 	for _, pat := range cfg.patterns {
 		if ok, _ := filepath.Match(pat, base); ok {
 			return true
@@ -440,31 +435,25 @@ func fileMatches(root string, absPath string, cfg config) bool {
 
 func listMatchingFiles(root string, cfg config) []string {
 	var files []string
-	if cfg.recursive {
-		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			if d.IsDir() {
-				return nil
-			}
-			abs, _ := filepath.Abs(path)
-			if fileMatches(root, abs, cfg) {
-				files = append(files, abs)
-			}
+	walkFn := func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
 			return nil
-		})
-		return files
-	}
-	entries, _ := os.ReadDir(root)
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
 		}
-		p := filepath.Join(root, e.Name())
-		abs, _ := filepath.Abs(p)
-		if fileMatches(root, abs, cfg) {
+		if abs, err := filepath.Abs(path); err == nil && fileMatches(root, abs, cfg) {
 			files = append(files, abs)
+		}
+		return nil
+	}
+
+	if cfg.recursive {
+		_ = filepath.WalkDir(root, walkFn)
+	} else {
+		entries, _ := os.ReadDir(root)
+		for _, e := range entries {
+			if !e.IsDir() {
+				p := filepath.Join(root, e.Name())
+				_ = walkFn(p, e, nil)
+			}
 		}
 	}
 	return files
@@ -474,24 +463,34 @@ func parseArgs() (config, error) {
 	var recursive bool
 	var maxLines int
 	var utc bool
-	var pollMs int
-	flag.BoolVar(&recursive, "recursive", false, "watch directories recursively")
-	flag.BoolVar(&recursive, "r", false, "watch directories recursively (shorthand)")
+	flag.BoolVar(&recursive, "recursive", true, "watch directories recursively")
+	flag.BoolVar(&recursive, "r", true, "watch directories recursively (shorthand)")
 	flag.IntVar(&maxLines, "max-lines", 5000, "maximum lines to retain in the viewport")
 	flag.BoolVar(&utc, "utc", false, "render timestamps in UTC")
-	flag.IntVar(&pollMs, "win-poll-ms", 700, "Windows fallback polling interval in milliseconds")
+
+	// Show help if no args
+	if len(os.Args) <= 1 {
+		flag.Usage()
+		os.Exit(0)
+	}
+
 	flag.Parse()
+
 	args := flag.Args()
 	if len(args) < 1 {
 		return config{}, fmt.Errorf("missing directory argument")
 	}
-	cfg := config{rootDir: args[0], recursive: recursive, maxLines: maxLines, utc: utc, winPollMs: pollMs}
-	// Patterns: comma-separated globs in arg[1]; default to *.log,*.txt when omitted
+
+	cfg := config{
+		rootDir:   args[0],
+		recursive: recursive,
+		maxLines:  maxLines,
+		utc:       utc,
+	}
+
 	if len(args) >= 2 {
-		raw := strings.Split(args[1], ",")
-		for _, s := range raw {
-			s = strings.TrimSpace(s)
-			if s != "" {
+		for _, s := range strings.Split(args[1], ",") {
+			if s = strings.TrimSpace(s); s != "" {
 				cfg.patterns = append(cfg.patterns, s)
 			}
 		}
@@ -503,39 +502,62 @@ func parseArgs() (config, error) {
 }
 
 func main() {
-
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <directory> [pattern_globs] [--recursive] [--max-lines N] [--utc] [--win-poll-ms M]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <directory> [pattern_globs] [--recursive] [--max-lines N] [--utc]\n", filepath.Base(os.Args[0]))
 		fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
-		fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs \"*.log,*.txt\" --recursive --max-lines 10000")
-		fmt.Fprintln(flag.CommandLine.Output(), "  logwat C:/ProgramData/Microsoft/IntuneManagementExtension/Logs --utc")
+		fmt.Fprintln(flag.CommandLine.Output(), "  logwat /var/log \"*.log,*.txt\" --recursive --max-lines 10000")
+		fmt.Fprintln(flag.CommandLine.Output(), "  logwat /var/log --utc")
 	}
 
-	// Show help and exit if no parameters are provided
-	if len(os.Args) <= 1 {
-		flag.Usage()
-		os.Exit(0)
-	}
-
-	cfg, err := parseArgs()
+	cfg, err := parseArgs() // Remove the os.Args check from here
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		flag.Usage()
 		os.Exit(2)
 	}
+
 	if _, err := os.Stat(cfg.rootDir); err != nil {
 		fmt.Fprintln(os.Stderr, "Directory not accessible:", err)
 		os.Exit(2)
 	}
 
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle OS signals for graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
 	m := initialModel(cfg)
 	p := tea.NewProgram(m, tea.WithAltScreen())
-	if err := watchAndTail(cfg, p); err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to start watcher:", err)
-		os.Exit(1)
-	}
+
+	// Start watcher in background
+	var watchErr error
+	watchDone := make(chan struct{})
+	go func() {
+		watchErr = watchAndTail(ctx, cfg, p)
+		close(watchDone)
+	}()
+
+	// Run the UI
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
+		cancel()
+		<-watchDone
+		os.Exit(1)
+	}
+
+	// Graceful shutdown
+	cancel()
+	<-watchDone
+
+	if watchErr != nil && !errors.Is(watchErr, context.Canceled) {
+		fmt.Fprintln(os.Stderr, "Watcher error:", watchErr)
 		os.Exit(1)
 	}
 }

@@ -1,6 +1,6 @@
 module logwat
 
-go 1.20
+go 1.24
 
 require (
 	github.com/charmbracelet/bubbles v0.18.0
