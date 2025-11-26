@@ -16,6 +16,7 @@ PREFIXES=(
   "INFO -"
   "DEBUG -"
   "ERROR -"
+  "FATAL -"
 )
 
 # Function to generate random string of variable length
@@ -66,6 +67,6 @@ while true; do
     generate_log_line >> "$log_file"
   done
   
-  # Random interval between 1-4 seconds
-  sleep $((RANDOM % 3 + 1))
+  ms=$((RANDOM % 100))
+  sleep "0.$(printf '%03d' "$ms")"
 done
