@@ -141,10 +141,33 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case errMsg:
-		// Append error line instead of replacing view
+		// Render internal errors in the same 3-column layout (time | path | text)
 		if msg != nil {
+			// Timestamp
+			t := time.Now()
+			if m.cfg.utc {
+				t = t.UTC()
+			}
+			tsRaw := t.Format("02.01.2006 15:04:05")
+			ts := m.styleTime.Render(tsRaw)
+
+			// Path column labeled as "error" and padded to the current width
+			pathLabel := "error"
+			w := displayWidth(stripANSI(pathLabel))
+			if w > m.pathColWidth {
+				m.pathColWidth = w
+			}
+			pad := m.pathColWidth - w
+			if pad < 0 {
+				pad = 0
+			}
+			paddedPath := pathLabel + strings.Repeat(" ", pad)
+			pStyled := m.stylePath.Render(paddedPath)
+
+			// Error text in red
 			errStyle := m.styleText.Foreground(lipgloss.Color("#ff6b6b"))
-			m.lines.append(errStyle.Render("[err] " + msg.Error()))
+			line := ts + " " + pStyled + "  " + errStyle.Render(msg.Error())
+			m.lines.append(line)
 			m.flushDue = true
 			return m, tea.Tick(m.flushEvery, func(time.Time) tea.Msg { return flushMsg{} })
 		}
@@ -457,6 +480,26 @@ func listMatchingFiles(root string, cfg config) []string {
 		}
 	}
 	return files
+}
+
+// computeMaxRelPathWidth inspects all currently matching files and returns the
+// maximum printable width of their relative paths. This helps to establish a
+// stable initial width for the path column so early lines don't look too short.
+func computeMaxRelPathWidth(root string, cfg config) int {
+	maxW := 0
+	files := listMatchingFiles(root, cfg)
+	for _, abs := range files {
+		rel, err := filepath.Rel(root, abs)
+		if err != nil {
+			continue
+		}
+		rel = filepath.Clean(rel)
+		w := displayWidth(stripANSI(rel))
+		if w > maxW {
+			maxW = w
+		}
+	}
+	return maxW
 }
 
 func parseArgs() (config, error) {
