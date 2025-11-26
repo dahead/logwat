@@ -348,7 +348,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.paused {
 				// resume: drain remaining queued lines
 				for _, l := range m.pausedQueue {
-					m.ingestLogLine(logLine(l))
+					m.ingestLogLine(l)
 				}
 				m.pausedQueue = m.pausedQueue[:0]
 				m.flushDue = true
@@ -364,7 +364,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// shift
 				copy(m.pausedQueue[0:], m.pausedQueue[1:])
 				m.pausedQueue = m.pausedQueue[:len(m.pausedQueue)-1]
-				m.ingestLogLine(logLine(l))
+				m.ingestLogLine(l)
 				m.flushDue = true
 				// Do not auto GotoBottom while paused; just rebuild
 				return m, tea.Tick(m.flushEvery, func(time.Time) tea.Msg { return flushMsg{} })
@@ -1192,7 +1192,6 @@ func (m *model) entriesSet(i int, e entry) {
 func (m *model) rebuildViewport() {
 	// Re-render the content from structured entries
 	var out []string
-	m.pathColWidth = m.pathColWidth // preserved across renders
 	for i := 0; i < m.entriesSize; i++ {
 		e := m.entriesGet(i)
 		// Apply entry-level filtering: if filter is active and collapsed, we include entry
@@ -1404,38 +1403,6 @@ func (m *model) renderContinuationLine(t time.Time, text string, sev severity) s
 	return indent + m.applySeverityStyle(text, sev)
 }
 
-// ringBuf is a fixed-capacity ring buffer for strings
-type ringBuf struct {
-	buf  []string
-	head int
-	size int
-}
-
-func newRingBuf(capacity int) *ringBuf {
-	return &ringBuf{buf: make([]string, capacity)}
-}
-
-func (r *ringBuf) append(s string) {
-	if len(r.buf) == 0 {
-		return
-	}
-	idx := (r.head + r.size) % len(r.buf)
-	r.buf[idx] = s
-	if r.size < len(r.buf) {
-		r.size++
-	} else {
-		r.head = (r.head + 1) % len(r.buf)
-	}
-}
-
-func (r *ringBuf) slice() []string {
-	out := make([]string, r.size)
-	for i := 0; i < r.size; i++ {
-		out[i] = r.buf[(r.head+i)%len(r.buf)]
-	}
-	return out
-}
-
 func watchAndTail(ctx context.Context, cfg config, p *tea.Program) error {
 	absRoot, err := filepath.Abs(cfg.rootDir)
 	if err != nil {
@@ -1638,7 +1605,7 @@ func inodeDev(fi os.FileInfo) (uint64, uint64) {
 		return 0, 0
 	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-		return uint64(st.Ino), uint64(st.Dev)
+		return st.Ino, st.Dev
 	}
 	return 0, 0
 }
@@ -1725,26 +1692,6 @@ func listMatchingFiles(root string, cfg config) []string {
 		}
 	}
 	return files
-}
-
-// computeMaxRelPathWidth inspects all currently matching files and returns the
-// maximum printable width of their relative paths. This helps to establish a
-// stable initial width for the path column so early lines don't look too short.
-func computeMaxRelPathWidth(root string, cfg config) int {
-	maxW := 0
-	files := listMatchingFiles(root, cfg)
-	for _, abs := range files {
-		rel, err := filepath.Rel(root, abs)
-		if err != nil {
-			continue
-		}
-		rel = filepath.Clean(rel)
-		w := displayWidth(stripANSI(rel))
-		if w > maxW {
-			maxW = w
-		}
-	}
-	return maxW
 }
 
 func parseArgs() (config, error) {
@@ -1836,11 +1783,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		flag.Usage()
 		os.Exit(2)
-	}
-
-	// Ensure rootDirs is populated (backward compatibility if parseArgs ever changes)
-	if len(cfg.rootDirs) == 0 && cfg.rootDir != "" {
-		cfg.rootDirs = []string{cfg.rootDir}
 	}
 	// Validate all roots exist
 	for _, r := range cfg.rootDirs {
