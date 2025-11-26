@@ -48,7 +48,11 @@ func max(a, b int) int {
 }
 
 type config struct {
+	// rootDir is kept for backward compatibility and for per-watcher config.
+	// When multiple roots are provided, rootDirs holds all of them and rootDir
+	// contains the first one.
 	rootDir   string
+	rootDirs  []string
 	patterns  []string // multiple globs, e.g. *.log,*.txt
 	recursive bool
 	maxLines  int
@@ -162,6 +166,14 @@ type model struct {
 
 	// App header text
 	appHeader string
+
+	// --- Side Pane: per-file stats ---
+	paneVisible   bool
+	paneWidth     int
+	topN          int
+	fileStats     map[string]*fileStat // counts by rel and severity
+	fileFilterRel string               // when set, restrict view to this rel (in addition to text filter)
+	paneItems     []string             // ordered rel paths shown in pane (for 1-9 hotkeys)
 }
 
 type (
@@ -187,20 +199,38 @@ func initialModel(cfg config) model {
 		groupIdle:   350 * time.Millisecond,
 		expandAll:   false,
 		entriesCap:  max(1, cfg.maxLines),
+		paneWidth:   28,
+		topN:        9,
+		fileStats:   make(map[string]*fileStat),
 	}
 	// Compile highlight regexes (case-insensitive word boundaries where applicable)
 	m.reErr = regexp.MustCompile(`(?i)\b(error|failed|fail|panic|fatal|exception)\b`)
 	m.reWarn = regexp.MustCompile(`(?i)\b(warn|warning|degrad|slow|timeout)\b`)
 	m.reInfo = regexp.MustCompile(`(?i)\b(info|started|listening|ready)\b`)
 	// Initial info lines and header
-	abs, _ := filepath.Abs(cfg.rootDir)
+	var rootsDisplay string
+	if len(cfg.rootDirs) > 1 {
+		// Show all roots, semicolon-separated, absolute paths
+		absRoots := make([]string, 0, len(cfg.rootDirs))
+		for _, r := range cfg.rootDirs {
+			if a, err := filepath.Abs(r); err == nil {
+				absRoots = append(absRoots, a)
+			} else {
+				absRoots = append(absRoots, r)
+			}
+		}
+		rootsDisplay = strings.Join(absRoots, ";")
+	} else {
+		abs, _ := filepath.Abs(cfg.rootDir)
+		rootsDisplay = abs
+	}
 	pat := strings.Join(cfg.patterns, ", ")
 	rec := "no"
 	if cfg.recursive {
 		rec = "yes"
 	}
-	m.appHeader = fmt.Sprintf("logwat — watching: %s (recursive: %s, patterns: %s)  | space: pause  /: filter  v: select  y: yank  e: expand  q: quit",
-		abs, rec, pat)
+	m.appHeader = fmt.Sprintf("logwat — watching: %s (recursive: %s, patterns: %s)  | space: pause  /: filter  v: select  y: yank  e: expand  p: pane  1-9: jump  0: clear  q: quit",
+		rootsDisplay, rec, pat)
 	banner := "Started: " + m.appHeader
 	m.appendEntryWithDedup(entry{when: time.Now(), rel: "info", lines: []string{banner}})
 	// Legend
@@ -214,7 +244,16 @@ func (m *model) Init() tea.Cmd { return nil }
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.vp.Width = msg.Width
+		// Adjust viewport width considering side pane visibility
+		if m.paneVisible {
+			left := msg.Width - m.paneWidth - 1
+			if left < 1 {
+				left = 1
+			}
+			m.vp.Width = left
+		} else {
+			m.vp.Width = msg.Width
+		}
 		// Reserve one line for header
 		h := msg.Height - 1
 		if h < 1 {
@@ -227,6 +266,37 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Allow quitting with Ctrl+C or 'q'
 		if msg.Type == tea.KeyCtrlC || msg.String() == "q" {
 			return m, tea.Quit
+		}
+		// Toggle side pane
+		if !m.filterEditing && msg.String() == "p" {
+			m.paneVisible = !m.paneVisible
+			// Resize viewport accordingly (approximate, actual width set on next WindowSize too)
+			if m.paneVisible {
+				if m.vp.Width > m.paneWidth+1 {
+					m.vp.Width = m.vp.Width - m.paneWidth - 1
+				}
+			} else {
+				m.vp.Width = m.vp.Width + m.paneWidth + 1
+			}
+			m.rebuildViewport()
+			return m, nil
+		}
+		// When pane visible, allow 1-9 to select Nth file and 0 to clear
+		if !m.filterEditing && m.paneVisible {
+			s := msg.String()
+			if s >= "1" && s <= "9" {
+				idx := int(s[0] - '1')
+				if idx >= 0 && idx < len(m.paneItems) {
+					m.fileFilterRel = m.paneItems[idx]
+					m.rebuildViewport()
+					return m, nil
+				}
+			}
+			if s == "0" {
+				m.fileFilterRel = ""
+				m.rebuildViewport()
+				return m, nil
+			}
 		}
 		// Filter input mode handling
 		if m.filterEditing {
@@ -464,6 +534,12 @@ func (m *model) View() string {
 			tags = append(tags, "VISUAL")
 		}
 	}
+	if m.fileFilterRel != "" {
+		tags = append(tags, "FILE:"+m.fileFilterRel)
+	}
+	if m.paneVisible {
+		tags = append(tags, "PANE")
+	}
 	if len(tags) > 0 {
 		header = header + "  [" + strings.Join(tags, ", ") + "]"
 	}
@@ -474,8 +550,165 @@ func (m *model) View() string {
 		}
 	}
 	hdr := m.styleInfo.Render(header)
-	content := m.vp.View()
-	return hdr + "\n" + content
+	left := m.vp.View()
+	if !m.paneVisible {
+		return hdr + "\n" + left
+	}
+	// Compose two columns: left viewport and right pane
+	pane := m.renderPane(m.vp.Height)
+	composed := m.composeColumns(left, pane, m.vp.Width, m.paneWidth)
+	return hdr + "\n" + composed
+}
+
+// renderPane builds the right-side pane content showing top N files by total messages and severities.
+func (m *model) renderPane(height int) string {
+	// Collect stats into a sortable slice
+	type pair struct {
+		rel string
+		st  *fileStat
+	}
+	items := make([]pair, 0, len(m.fileStats))
+	for rel, st := range m.fileStats {
+		if st.total > 0 {
+			items = append(items, pair{rel: rel, st: st})
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].st.total == items[j].st.total {
+			return items[i].rel < items[j].rel
+		}
+		return items[i].st.total > items[j].st.total
+	})
+	// Limit to topN
+	n := m.topN
+	if n <= 0 {
+		n = 9
+	}
+	if len(items) > n {
+		items = items[:n]
+	}
+	// Save order for hotkeys
+	m.paneItems = m.paneItems[:0]
+	for _, it := range items {
+		m.paneItems = append(m.paneItems, it.rel)
+	}
+	// Helper to truncate path to fit
+	truncate := func(s string, w int) string {
+		if displayWidth(s) <= w {
+			return s
+		}
+		// ensure room for ellipsis
+		if w <= 1 {
+			return s[:1]
+		}
+		// naive from the left keeping tail of path
+		// prefer the end (file name)
+		r := []rune(s)
+		if len(r) > w-1 {
+			return "…" + string(r[len(r)-(w-1):])
+		}
+		return s
+	}
+	lines := make([]string, 0, height)
+	header := m.styleInfo.Render("Files: top")
+	lines = append(lines, truncate(header, m.paneWidth))
+	// Compose each item line
+	for i, it := range items {
+		idx := fmt.Sprintf("%d.", i+1)
+		// Reserve space for idx and a space
+		pathMax := m.paneWidth - 2
+		if pathMax < 4 {
+			pathMax = 4
+		}
+		path := truncate(it.rel, pathMax)
+		// Build counts tail compactly; prioritize total on the right if room allows
+		counts := fmt.Sprintf(" %d ", it.st.total)
+		// Ensure the final line does not exceed paneWidth
+		base := idx + " " + path
+		// If too long, shrink path
+		if displayWidth(base+counts) > m.paneWidth {
+			over := displayWidth(base+counts) - m.paneWidth
+			// reduce path by over
+			pmax := displayWidth(path) - over
+			if pmax < 1 {
+				pmax = 1
+			}
+			path = truncate(path, pmax)
+			base = idx + " " + path
+		}
+		// Attach colored severities compact after a space if room allows
+		sevParts := []string{}
+		if it.st.err > 0 {
+			sevParts = append(sevParts, m.styleError.Render(fmt.Sprintf("E%d", it.st.err)))
+		}
+		if it.st.warn > 0 {
+			sevParts = append(sevParts, m.styleWarn.Render(fmt.Sprintf("W%d", it.st.warn)))
+		}
+		if it.st.info > 0 {
+			sevParts = append(sevParts, m.styleInfo.Render(fmt.Sprintf("I%d", it.st.info)))
+		}
+		sev := strings.Join(sevParts, " ")
+		line := base
+		if sev != "" {
+			// try to append sev within width
+			if displayWidth(line+" "+sev) <= m.paneWidth {
+				line = line + " " + sev
+			}
+		}
+		// finally try to append total count at the end aligned if room
+		if displayWidth(line+counts) <= m.paneWidth {
+			// pad spaces
+			pad := m.paneWidth - displayWidth(line+counts)
+			line = line + strings.Repeat(" ", pad) + counts
+		}
+		lines = append(lines, line)
+		if len(lines) >= height {
+			break
+		}
+	}
+	// pad to height
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// composeColumns merges left and right texts into two fixed-width columns
+func (m *model) composeColumns(left, right string, leftW, rightW int) string {
+	lnsL := strings.Split(left, "\n")
+	lnsR := strings.Split(right, "\n")
+	h := len(lnsL)
+	if len(lnsR) > h {
+		h = len(lnsR)
+	}
+	out := make([]string, 0, h)
+	padTo := func(s string, w int) string {
+		dw := displayWidth(s)
+		if dw >= w {
+			return s
+		}
+		return s + strings.Repeat(" ", w-dw)
+	}
+	for i := 0; i < h; i++ {
+		var l, r string
+		if i < len(lnsL) {
+			l = padTo(lnsL[i], leftW)
+		} else {
+			l = strings.Repeat(" ", leftW)
+		}
+		if i < len(lnsR) {
+			// ensure right does not exceed width: truncate if necessary
+			if displayWidth(lnsR[i]) > rightW {
+				r = lnsR[i][:max(0, rightW-1)]
+			} else {
+				r = padTo(lnsR[i], rightW)
+			}
+		} else {
+			r = strings.Repeat(" ", rightW)
+		}
+		out = append(out, l+" "+r)
+	}
+	return strings.Join(out, "\n")
 }
 
 // formatLine renders a single line in the 3-column layout. Used when expanding groups.
@@ -809,6 +1042,39 @@ type pendingGroup struct {
 	sev    severity
 }
 
+// fileStat tracks counts for a single rel path, split by severity
+type fileStat struct {
+	total int
+	info  int
+	warn  int
+	err   int
+}
+
+func (s *fileStat) inc(sev severity) {
+	s.total++
+	switch sev {
+	case SevError:
+		s.err++
+	case SevWarn:
+		s.warn++
+	default:
+		s.info++
+	}
+}
+
+// statFor returns the fileStat for a rel path, creating it if necessary
+func (m *model) statFor(rel string) *fileStat {
+	if m.fileStats == nil {
+		m.fileStats = make(map[string]*fileStat)
+	}
+	st := m.fileStats[rel]
+	if st == nil {
+		st = &fileStat{}
+		m.fileStats[rel] = st
+	}
+	return st
+}
+
 type entry struct {
 	when     time.Time
 	rel      string
@@ -880,6 +1146,11 @@ func (m *model) appendEntryWithDedup(e entry) {
 		if m.entryKeyNoTS(last) == key {
 			last.dupCount++
 			m.entriesSet(m.entriesSize-1, last)
+			// count duplicate towards stats as another occurrence
+			if m.fileStats != nil {
+				st := m.statFor(last.rel)
+				st.inc(last.sev)
+			}
 			return
 		}
 	}
@@ -900,6 +1171,11 @@ func (m *model) entriesPush(e entry) {
 		m.entriesSize++
 	} else {
 		m.entriesHead = (m.entriesHead + 1) % cap
+	}
+	// update per-file stats for the new entry
+	if m.fileStats != nil {
+		st := m.statFor(e.rel)
+		st.inc(e.sev)
 	}
 }
 
@@ -981,6 +1257,9 @@ func (m *model) rebuildViewport() {
 
 // linePassesFilter returns true if no filter is active or the pair rel|text passes the filter
 func (m *model) linePassesFilter(rel, text string) bool {
+	if m.fileFilterRel != "" && rel != m.fileFilterRel {
+		return false
+	}
 	if m.filterActive == "" {
 		return true
 	}
@@ -993,6 +1272,9 @@ func (m *model) linePassesFilter(rel, text string) bool {
 }
 
 func (m *model) entryPassesFilter(e entry) bool {
+	if m.fileFilterRel != "" && e.rel != m.fileFilterRel {
+		return false
+	}
 	if m.filterActive == "" {
 		return true
 	}
@@ -1317,6 +1599,11 @@ func readNewLines(ctx context.Context, path, root string, cfg config, state *tai
 
 	rel, _ := filepath.Rel(root, path)
 	rel = filepath.Clean(rel)
+	// If watching multiple roots, prefix the relative path with the root's base
+	// directory to avoid ambiguous names across roots.
+	if len(cfg.rootDirs) > 1 {
+		rel = filepath.Join(filepath.Base(root), rel)
+	}
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -1487,11 +1774,24 @@ func parseArgs() (config, error) {
 	}
 
 	cfg := config{
-		rootDir:   args[0],
 		recursive: recursive,
 		maxLines:  maxLines,
 		utc:       utc,
 	}
+
+	// Support multiple roots separated by ';'
+	rawRoots := strings.Split(args[0], ";")
+	for _, r := range rawRoots {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		cfg.rootDirs = append(cfg.rootDirs, r)
+	}
+	if len(cfg.rootDirs) == 0 {
+		return config{}, fmt.Errorf("no valid directories provided")
+	}
+	cfg.rootDir = cfg.rootDirs[0]
 
 	if len(args) >= 2 {
 		for _, s := range strings.Split(args[1], ",") {
@@ -1523,11 +1823,12 @@ func parseArgs() (config, error) {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <directory> [pattern_globs] [--recursive] [--max-lines N] [--utc] [--include globs] [--exclude globs]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s <directory[;directory2[;...]]> [pattern_globs] [--recursive] [--max-lines N] [--utc] [--include globs] [--exclude globs]\n", filepath.Base(os.Args[0]))
 		fmt.Fprintln(flag.CommandLine.Output(), "Examples:")
 		fmt.Fprintln(flag.CommandLine.Output(), "  logwat /var/log \"*.log,*.txt\" --recursive --max-lines 10000")
 		fmt.Fprintln(flag.CommandLine.Output(), "  logwat /var/log --utc")
 		fmt.Fprintln(flag.CommandLine.Output(), "  logwat /var/log --include \"**/*.log,*.txt\" --exclude \"**/archive/*,*.bak\"")
+		fmt.Fprintln(flag.CommandLine.Output(), "  logwat /var/log;/opt/app/logs --include \"**/*.log\"")
 	}
 
 	cfg, err := parseArgs() // Remove the os.Args check from here
@@ -1537,9 +1838,16 @@ func main() {
 		os.Exit(2)
 	}
 
-	if _, err := os.Stat(cfg.rootDir); err != nil {
-		fmt.Fprintln(os.Stderr, "Directory not accessible:", err)
-		os.Exit(2)
+	// Ensure rootDirs is populated (backward compatibility if parseArgs ever changes)
+	if len(cfg.rootDirs) == 0 && cfg.rootDir != "" {
+		cfg.rootDirs = []string{cfg.rootDir}
+	}
+	// Validate all roots exist
+	for _, r := range cfg.rootDirs {
+		if _, err := os.Stat(r); err != nil {
+			fmt.Fprintln(os.Stderr, "Directory not accessible:", r, "-", err)
+			os.Exit(2)
+		}
 	}
 
 	// Create context for graceful shutdown
@@ -1557,28 +1865,42 @@ func main() {
 	m := initialModel(cfg)
 	p := tea.NewProgram(&m, tea.WithAltScreen())
 
-	// Start watcher in background
-	var watchErr error
-	watchDone := make(chan struct{})
+	// Start one watcher per root directory in the background
+	errCh := make(chan error, len(cfg.rootDirs))
+	doneCh := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, r := range cfg.rootDirs {
+		r := r // shadow for closure
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cfgR := cfg
+			cfgR.rootDir = r
+			if err := watchAndTail(ctx, cfgR, p); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- err
+			}
+		}()
+	}
 	go func() {
-		watchErr = watchAndTail(ctx, cfg, p)
-		close(watchDone)
+		wg.Wait()
+		close(doneCh)
 	}()
 
 	// Run the UI
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		cancel()
-		<-watchDone
+		<-doneCh
 		os.Exit(1)
 	}
 
 	// Graceful shutdown
 	cancel()
-	<-watchDone
-
-	if watchErr != nil && !errors.Is(watchErr, context.Canceled) {
-		fmt.Fprintln(os.Stderr, "Watcher error:", watchErr)
+	<-doneCh
+	close(errCh)
+	// If any watcher reported an error, print the first one
+	if err, ok := <-errCh; ok {
+		fmt.Fprintln(os.Stderr, "Watcher error:", err)
 		os.Exit(1)
 	}
 }

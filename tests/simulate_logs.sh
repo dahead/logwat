@@ -3,7 +3,7 @@
 # Log simulation script - generates random log entries to /tmp/*.log files
 
 LOG_DIR="/tmp"
-LOG_FILES=("app.log" "system.log" "error.log" "access.log")
+LOG_FILES=("app.log" "system.log" "error.log" "access.log" "vpn.audit.log", "windows_update_kb123456789_error.log", "intune_ref14234handle.iwin.log")
 INTERVAL=2  # seconds between log entries
 
 # Array of log prefixes to make it more realistic
