@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -112,6 +114,7 @@ type model struct {
 	styleInfo    lipgloss.Style
 	styleWarn    lipgloss.Style
 	styleError   lipgloss.Style
+	styleSelect  lipgloss.Style
 	cfg          config
 	err          error
 	flushDue     bool
@@ -147,6 +150,18 @@ type model struct {
 	visibleLines  []string // last rendered, after filtering
 	matchLineIdxs []int    // line indices in visibleLines matching search
 	curMatch      int      // current selected match index in matchLineIdxs
+
+	// --- Pause/Queue ---
+	paused      bool      // when true, new lines are queued without scrolling
+	pausedQueue []logLine // queued incoming lines while paused
+
+	// --- Visual Selection ---
+	selectionActive bool // toggle visual selection mode
+	selAnchor       int  // anchor index in visibleLines (absolute)
+	// selection end is dynamic: current viewport YOffset
+
+	// App header text
+	appHeader string
 }
 
 type (
@@ -158,32 +173,35 @@ type (
 func initialModel(cfg config) model {
 	vp := viewport.New(0, 0)
 	m := model{
-		vp:         vp,
-		styleTime:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#5B8", Dark: "#5B8"}),
-		stylePath:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#58F", Dark: "#8AD"}),
-		styleText:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#111", Dark: "#DDD"}),
-		styleInfo:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#222", Dark: "#DDD"}),
-		styleWarn:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#C77D00", Dark: "#FFB020"}),
-		styleError: lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#C00000", Dark: "#FF6B6B"}),
-		cfg:        cfg,
-		flushEvery: 80 * time.Millisecond,
-		pending:    make(map[string]*pendingGroup),
-		groupIdle:  350 * time.Millisecond,
-		expandAll:  false,
-		entriesCap: max(1, cfg.maxLines),
+		vp:          vp,
+		styleTime:   lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#5B8", Dark: "#5B8"}),
+		stylePath:   lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#58F", Dark: "#8AD"}),
+		styleText:   lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#111", Dark: "#DDD"}),
+		styleInfo:   lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#222", Dark: "#DDD"}),
+		styleWarn:   lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#C77D00", Dark: "#FFB020"}),
+		styleError:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#C00000", Dark: "#FF6B6B"}),
+		styleSelect: lipgloss.NewStyle().Reverse(true),
+		cfg:         cfg,
+		flushEvery:  80 * time.Millisecond,
+		pending:     make(map[string]*pendingGroup),
+		groupIdle:   350 * time.Millisecond,
+		expandAll:   false,
+		entriesCap:  max(1, cfg.maxLines),
 	}
 	// Compile highlight regexes (case-insensitive word boundaries where applicable)
 	m.reErr = regexp.MustCompile(`(?i)\b(error|failed|fail|panic|fatal|exception)\b`)
 	m.reWarn = regexp.MustCompile(`(?i)\b(warn|warning|degrad|slow|timeout)\b`)
 	m.reInfo = regexp.MustCompile(`(?i)\b(info|started|listening|ready)\b`)
-	// Initial info lines
+	// Initial info lines and header
 	abs, _ := filepath.Abs(cfg.rootDir)
 	pat := strings.Join(cfg.patterns, ", ")
 	rec := "no"
 	if cfg.recursive {
 		rec = "yes"
 	}
-	banner := fmt.Sprintf("logwat - watching: %s (recursive: %s, pattern: %s). Keys: / filter, Enter apply, Esc clear, n/N next/prev, e expand, q quit", abs, rec, pat)
+	m.appHeader = fmt.Sprintf("logwat — watching: %s (recursive: %s, patterns: %s)  | space: pause  /: filter  v: select  y: yank  e: expand  q: quit",
+		abs, rec, pat)
+	banner := "Started: " + m.appHeader
 	m.appendEntryWithDedup(entry{when: time.Now(), rel: "info", lines: []string{banner}})
 	// Legend
 	legend := "Legend: " + m.styleInfo.Render("INFO") + "  " + m.styleWarn.Render("WARN") + "  " + m.styleError.Render("ERROR")
@@ -254,6 +272,93 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+		// Pause/resume toggle (not while editing filter)
+		if msg.String() == " " { // space
+			m.paused = !m.paused
+			if !m.paused {
+				// resume: drain remaining queued lines
+				for _, l := range m.pausedQueue {
+					m.ingestLogLine(logLine(l))
+				}
+				m.pausedQueue = m.pausedQueue[:0]
+				m.flushDue = true
+				return m, tea.Tick(m.flushEvery, func(time.Time) tea.Msg { return flushMsg{} })
+			}
+			// when pausing, do nothing else
+			return m, nil
+		}
+		// When paused: step through queued items with j/k
+		if m.paused && (msg.String() == "j" || msg.String() == "k") {
+			if len(m.pausedQueue) > 0 {
+				l := m.pausedQueue[0]
+				// shift
+				copy(m.pausedQueue[0:], m.pausedQueue[1:])
+				m.pausedQueue = m.pausedQueue[:len(m.pausedQueue)-1]
+				m.ingestLogLine(logLine(l))
+				m.flushDue = true
+				// Do not auto GotoBottom while paused; just rebuild
+				return m, tea.Tick(m.flushEvery, func(time.Time) tea.Msg { return flushMsg{} })
+			}
+			return m, nil
+		}
+		// Visual selection start/end
+		if msg.String() == "v" {
+			if !m.selectionActive {
+				m.selectionActive = true
+				if m.vp.YOffset < 0 {
+					m.vp.SetYOffset(0)
+				}
+				m.selAnchor = m.vp.YOffset
+			} else {
+				// end selection
+				m.selectionActive = false
+			}
+			m.rebuildViewport()
+			return m, nil
+		}
+		if msg.String() == "y" { // yank selection
+			// Compute selection range (if active use anchor..current, else nothing)
+			var start, end int
+			if m.selAnchor < 0 {
+				m.selAnchor = 0
+			}
+			cur := m.vp.YOffset
+			if cur < 0 {
+				cur = 0
+			}
+			if m.selAnchor <= cur {
+				start, end = m.selAnchor, cur
+			} else {
+				start, end = cur, m.selAnchor
+			}
+			if start < 0 {
+				start = 0
+			}
+			if end >= len(m.visibleLines) {
+				end = len(m.visibleLines) - 1
+			}
+			if len(m.visibleLines) > 0 && end >= start {
+				text := m.collectSelectedText(start, end)
+				copied := copyToClipboard(text)
+				path, werr := writeSelectionToFile(text)
+				status := fmt.Sprintf("Yanked %d lines. ", end-start+1)
+				if copied {
+					status += "Copied to clipboard. "
+				} else {
+					status += "Clipboard unavailable. "
+				}
+				if werr == nil {
+					status += "Saved: " + path
+				} else {
+					status += "Save failed: " + werr.Error()
+				}
+				m.appendEntryWithDedup(entry{when: time.Now(), rel: "info", lines: []string{status}})
+				m.rebuildViewport()
+			}
+			// end selection after yank
+			m.selectionActive = false
+			return m, nil
+		}
 		if msg.String() == "e" {
 			// toggle expand/collapse of grouped entries
 			m.expandAll = !m.expandAll
@@ -290,6 +395,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case logLineMsg:
 		l := logLine(msg)
+		if m.paused {
+			m.pausedQueue = append(m.pausedQueue, l)
+			return m, nil
+		}
 		m.ingestLogLine(l)
 		// Schedule a debounced flush to the viewport
 		m.flushDue = true
@@ -299,7 +408,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Flush any idle pending groups
 			m.flushIdleGroups()
 			m.rebuildViewport()
-			m.vp.GotoBottom()
+			if !m.paused {
+				m.vp.GotoBottom()
+			}
 			m.flushDue = false
 		}
 		return m, nil
@@ -326,21 +437,41 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) View() string {
-	// Add a small header with filter/search status
-	header := ""
+	// Header: static app header + dynamic states; show filter input only on '/'
+	header := m.appHeader
+	var tags []string
+	if m.paused {
+		tags = append(tags, fmt.Sprintf("PAUSED (%d queued)", len(m.pausedQueue)))
+	}
+	if m.selectionActive {
+		start := m.selAnchor
+		end := m.vp.YOffset
+		if start > end {
+			start, end = end, start
+		}
+		if start < 0 {
+			start = 0
+		}
+		if end < 0 {
+			end = 0
+		}
+		if end >= len(m.visibleLines) {
+			end = len(m.visibleLines) - 1
+		}
+		if end >= start && len(m.visibleLines) > 0 {
+			tags = append(tags, fmt.Sprintf("VISUAL %d..%d", start+1, end+1))
+		} else {
+			tags = append(tags, "VISUAL")
+		}
+	}
+	if len(tags) > 0 {
+		header = header + "  [" + strings.Join(tags, ", ") + "]"
+	}
 	if m.filterEditing {
 		header = "/" + m.filterEdit
-	} else if m.filterActive != "" {
-		mode := "substr"
-		if m.filterIsRegex {
-			mode = "regex"
-		}
-		header = fmt.Sprintf("filter(%s): %q  matches: %d", mode, m.filterActive, len(m.matchLineIdxs))
 		if m.filterErr != "" {
 			header += "  err: " + m.filterErr
 		}
-	} else {
-		header = "Press / to filter, n/N to navigate matches, e to expand, q to quit"
 	}
 	hdr := m.styleInfo.Render(header)
 	content := m.vp.View()
@@ -407,6 +538,94 @@ func stripANSI(s string) string {
 // displayWidth returns the printable width, ignoring ANSI
 func displayWidth(s string) int {
 	return lipgloss.Width(stripANSI(s))
+}
+
+// collectSelectedText returns the selected visible lines [start,end] stripped of ANSI codes
+func (m *model) collectSelectedText(start, end int) string {
+	if start < 0 {
+		start = 0
+	}
+	if end >= len(m.visibleLines) {
+		end = len(m.visibleLines) - 1
+	}
+	if end < start || len(m.visibleLines) == 0 {
+		return ""
+	}
+	out := make([]string, 0, end-start+1)
+	for i := start; i <= end; i++ {
+		out = append(out, stripANSI(m.visibleLines[i]))
+	}
+	return strings.Join(out, "\n")
+}
+
+// copyToClipboard tries best-effort cross-platform clipboard copy.
+// Returns true if a clipboard utility was found and data was piped successfully.
+func copyToClipboard(s string) bool {
+	// Windows
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("cmd", "/c", "clip")
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return false
+		}
+		if err := cmd.Start(); err != nil {
+			return false
+		}
+		_, _ = io.WriteString(stdin, s)
+		_ = stdin.Close()
+		return cmd.Wait() == nil
+	}
+	// macOS
+	if runtime.GOOS == "darwin" {
+		if exec.Command("which", "pbcopy").Run() == nil {
+			cmd := exec.Command("pbcopy")
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				return false
+			}
+			if err := cmd.Start(); err != nil {
+				return false
+			}
+			_, _ = io.WriteString(stdin, s)
+			_ = stdin.Close()
+			return cmd.Wait() == nil
+		}
+		return false
+	}
+	// Linux/BSD: try wl-copy, xclip, xsel in this order
+	candidates := [][]string{
+		{"wl-copy"},
+		{"xclip", "-selection", "clipboard"},
+		{"xsel", "--clipboard", "--input"},
+	}
+	for _, c := range candidates {
+		if exec.Command("which", c[0]).Run() == nil {
+			cmd := exec.Command(c[0], c[1:]...)
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				continue
+			}
+			if err := cmd.Start(); err != nil {
+				continue
+			}
+			_, _ = io.WriteString(stdin, s)
+			_ = stdin.Close()
+			if cmd.Wait() == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// writeSelectionToFile writes the text into a temp file and returns the path.
+func writeSelectionToFile(s string) (string, error) {
+	name := fmt.Sprintf("logwat-%d.txt", time.Now().UnixNano())
+	path := filepath.Join(os.TempDir(), name)
+	if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // --- Highlighting & severity ---
@@ -737,6 +956,25 @@ func (m *model) rebuildViewport() {
 	highlighted := make([]string, len(m.visibleLines))
 	for i, ln := range m.visibleLines {
 		highlighted[i] = m.highlightMatches(ln)
+	}
+	// Apply visual selection highlighting if active
+	if m.selectionActive && len(highlighted) > 0 {
+		start := m.selAnchor
+		end := m.vp.YOffset
+		if start > end {
+			start, end = end, start
+		}
+		if start < 0 {
+			start = 0
+		}
+		if end >= len(highlighted) {
+			end = len(highlighted) - 1
+		}
+		if end >= start {
+			for i := start; i <= end; i++ {
+				highlighted[i] = m.styleSelect.Render(highlighted[i])
+			}
+		}
 	}
 	m.vp.SetContent(strings.Join(highlighted, "\n"))
 }
