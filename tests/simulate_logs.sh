@@ -21,7 +21,7 @@ PREFIXES=(
 
 # Function to generate random string of variable length
 generate_random_text() {
-  local length=$((RANDOM % 1000 + 24))  # 24-1024 characters
+  local length=$((RANDOM % 2048 + 60))  # 24-1024 characters
   head -c "$length" /dev/urandom | tr -dc 'A-Za-z0-9 _.,;:()[]{}' | fold -w 80 | head -1
 }
 
@@ -67,6 +67,6 @@ while true; do
     generate_log_line >> "$log_file"
   done
   
-  ms=$((RANDOM % 60))
-  sleep "0.$(printf '%03d' "$ms")"
+  # ms=$((RANDOM % 5))
+  # sleep "0.$(printf '%03d' "$ms")"
 done

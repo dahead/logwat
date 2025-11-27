@@ -40,6 +40,51 @@ import (
 )
 
 // small generic-less helper (Go 1.20 compatible) used for capacities
+
+// cache for filepath.Rel results across the process
+var relCache struct {
+	mu sync.RWMutex
+	m  map[string]string // key: root + "|" + path, value: rel or special ".." prefix meaning outside
+}
+
+// relCached computes a relative path once and caches it. ok=false if path is outside root or computation failed.
+func relCached(root, path string) (rel string, ok bool) {
+	key := root + "|" + path
+	relCache.mu.RLock()
+	if relCache.m != nil {
+		if v, hit := relCache.m[key]; hit {
+			if strings.HasPrefix(v, "..") {
+				relCache.mu.RUnlock()
+				return "", false
+			}
+			relCache.mu.RUnlock()
+			return v, true
+		}
+	}
+	relCache.mu.RUnlock()
+	// miss: compute
+	r, err := filepath.Rel(root, path)
+	if err != nil {
+		r = ".." // mark as outside/invalid
+	}
+	r = filepath.Clean(r)
+	relCache.mu.Lock()
+	if relCache.m == nil {
+		relCache.m = make(map[string]string, 1024)
+	}
+	// reset when too big to keep memory bounded
+	if len(relCache.m) > 4096 {
+		relCache.m = make(map[string]string, 1024)
+	}
+	relCache.m[key] = r
+	relCache.mu.Unlock()
+	if strings.HasPrefix(r, "..") {
+		return "", false
+	}
+	return r, true
+}
+
+// small generic-less helper (Go 1.20 compatible) used for capacities
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -192,6 +237,12 @@ type model struct {
 	fileStats     map[string]*fileStat // counts by rel and severity
 	fileFilterRel string               // when set, restrict view to this rel (in addition to text filter)
 	paneItems     []string             // ordered rel paths shown in pane (for 1-9 hotkeys)
+
+	// --- Caches for performance ---
+	// Cache for stripped-ANSI strings (small, best-effort)
+	ansiCache map[string]string
+	// Cached lowercase of active filter for faster substring checks
+	filterActiveLower string
 }
 
 type (
@@ -679,13 +730,17 @@ func (m *model) renderPane(height int) string {
 		items = items[:n]
 	}
 	// Save order for hotkeys
-	m.paneItems = m.paneItems[:0]
+	if cap(m.paneItems) < len(items) {
+		m.paneItems = make([]string, 0, len(items))
+	} else {
+		m.paneItems = m.paneItems[:0]
+	}
 	for _, it := range items {
 		m.paneItems = append(m.paneItems, it.rel)
 	}
 	// Helper to truncate path to fit
 	truncate := func(s string, w int) string {
-		if displayWidth(s) <= w {
+		if m.displayWidthM(s) <= w {
 			return s
 		}
 		// ensure room for ellipsis
@@ -717,10 +772,10 @@ func (m *model) renderPane(height int) string {
 		// Ensure the final line does not exceed paneWidth
 		base := idx + " " + path
 		// If too long, shrink path
-		if displayWidth(base+counts) > m.paneWidth {
-			over := displayWidth(base+counts) - m.paneWidth
+		if m.displayWidthM(base+counts) > m.paneWidth {
+			over := m.displayWidthM(base+counts) - m.paneWidth
 			// reduce path by over
-			pmax := displayWidth(path) - over
+			pmax := m.displayWidthM(path) - over
 			if pmax < 1 {
 				pmax = 1
 			}
@@ -728,7 +783,7 @@ func (m *model) renderPane(height int) string {
 			base = idx + " " + path
 		}
 		// Attach colored severities compact after a space if room allows
-		sevParts := []string{}
+		sevParts := make([]string, 0, 3)
 		if it.st.err > 0 {
 			sevParts = append(sevParts, m.styleError.Render(fmt.Sprintf("E%d", it.st.err)))
 		}
@@ -742,14 +797,14 @@ func (m *model) renderPane(height int) string {
 		line := base
 		if sev != "" {
 			// try to append sev within width
-			if displayWidth(line+" "+sev) <= m.paneWidth {
+			if m.displayWidthM(line+" "+sev) <= m.paneWidth {
 				line = line + " " + sev
 			}
 		}
 		// finally try to append total count at the end aligned if room
-		if displayWidth(line+counts) <= m.paneWidth {
+		if m.displayWidthM(line+counts) <= m.paneWidth {
 			// pad spaces
-			pad := m.paneWidth - displayWidth(line+counts)
+			pad := m.paneWidth - m.displayWidthM(line+counts)
 			line = line + strings.Repeat(" ", pad) + counts
 		}
 		// Highlight active selection
@@ -778,7 +833,7 @@ func (m *model) composeColumns(left, right string, leftW, rightW int) string {
 	}
 	out := make([]string, 0, h)
 	padTo := func(s string, w int) string {
-		dw := displayWidth(s)
+		dw := m.displayWidthM(s)
 		if dw >= w {
 			return s
 		}
@@ -793,7 +848,7 @@ func (m *model) composeColumns(left, right string, leftW, rightW int) string {
 		}
 		if i < len(lnsR) {
 			// ensure right does not exceed width: truncate if necessary
-			if displayWidth(lnsR[i]) > rightW {
+			if m.displayWidthM(lnsR[i]) > rightW {
 				r = lnsR[i][:max(0, rightW-1)]
 			} else {
 				r = padTo(lnsR[i], rightW)
@@ -825,7 +880,7 @@ func (m *model) formatLine(l logLine) string {
 	// Path column with fixed width padding
 	p := l.rel
 	// track maximum path width (without style)
-	w := displayWidth(stripANSI(p))
+	w := m.displayWidthM(p)
 	if w > m.pathColWidth {
 		m.pathColWidth = w
 	}
@@ -865,7 +920,34 @@ func stripANSI(s string) string {
 
 // displayWidth returns the printable width, ignoring ANSI
 func displayWidth(s string) int {
+	// Fallback plain function kept for compatibility in non-model contexts
 	return lipgloss.Width(stripANSI(s))
+}
+
+// stripANSICached returns a cached ANSI-stripped string if available.
+func (m *model) stripANSICached(s string) string {
+	if s == "" {
+		return ""
+	}
+	if m.ansiCache == nil {
+		m.ansiCache = make(map[string]string, 256)
+	}
+	if v, ok := m.ansiCache[s]; ok {
+		return v
+	}
+	v := stripANSI(s)
+	// simple size cap to prevent unbounded growth
+	if len(m.ansiCache) > 2048 {
+		// reset map when too big
+		m.ansiCache = make(map[string]string, 256)
+	}
+	m.ansiCache[s] = v
+	return v
+}
+
+// displayWidthM is a model-aware width function using the cached ANSI stripping
+func (m *model) displayWidthM(s string) int {
+	return lipgloss.Width(m.stripANSICached(s))
 }
 
 // collectSelectedText returns the selected visible lines [start,end] stripped of ANSI codes
@@ -881,7 +963,7 @@ func (m *model) collectSelectedText(start, end int) string {
 	}
 	out := make([]string, 0, end-start+1)
 	for i := start; i <= end; i++ {
-		out = append(out, stripANSI(m.visibleLines[i]))
+		out = append(out, m.stripANSICached(m.visibleLines[i]))
 	}
 	return strings.Join(out, "\n")
 }
@@ -1286,7 +1368,7 @@ func (m *model) entriesSet(i int, e entry) {
 
 func (m *model) rebuildViewport() {
 	// Re-render the content from structured entries
-	var out []string
+	out := make([]string, 0, m.entriesSize*2)
 	for i := 0; i < m.entriesSize; i++ {
 		e := m.entriesGet(i)
 		// Apply entry-level filtering: if filter is active and collapsed, we include entry
@@ -1320,33 +1402,38 @@ func (m *model) rebuildViewport() {
 			}
 		}
 	}
-	// compute search matches and highlight them if filterActive present
+	// compute search matches on the freshly rendered lines
 	m.visibleLines = out
 	m.computeMatches()
-	highlighted := make([]string, len(m.visibleLines))
+	// Build the final content with a strings.Builder to minimize allocations
+	var b strings.Builder
+	// Rough capacity hint: average line ~80 chars
+	b.Grow(len(m.visibleLines) * 80)
+	selStart, selEnd := -1, -1
+	if m.selectionActive && len(m.visibleLines) > 0 {
+		selStart = m.selAnchor
+		selEnd = m.vp.YOffset
+		if selStart > selEnd {
+			selStart, selEnd = selEnd, selStart
+		}
+		if selStart < 0 {
+			selStart = 0
+		}
+		if selEnd >= len(m.visibleLines) {
+			selEnd = len(m.visibleLines) - 1
+		}
+	}
 	for i, ln := range m.visibleLines {
-		highlighted[i] = m.highlightMatches(ln)
-	}
-	// Apply visual selection highlighting if active
-	if m.selectionActive && len(highlighted) > 0 {
-		start := m.selAnchor
-		end := m.vp.YOffset
-		if start > end {
-			start, end = end, start
+		hl := m.highlightMatches(ln)
+		if selStart != -1 && i >= selStart && i <= selEnd {
+			hl = m.styleSelect.Render(hl)
 		}
-		if start < 0 {
-			start = 0
-		}
-		if end >= len(highlighted) {
-			end = len(highlighted) - 1
-		}
-		if end >= start {
-			for i := start; i <= end; i++ {
-				highlighted[i] = m.styleSelect.Render(highlighted[i])
-			}
+		b.WriteString(hl)
+		if i+1 < len(m.visibleLines) {
+			b.WriteByte('\n')
 		}
 	}
-	m.vp.SetContent(strings.Join(highlighted, "\n"))
+	m.vp.SetContent(b.String())
 }
 
 // linePassesFilter returns true if no filter is active or the pair rel|text passes the filter
@@ -1362,7 +1449,7 @@ func (m *model) linePassesFilter(rel, text string) bool {
 		return m.filterRe.MatchString(hay)
 	}
 	// substring (case-insensitive)
-	return strings.Contains(strings.ToLower(hay), strings.ToLower(m.filterActive))
+	return strings.Contains(strings.ToLower(hay), m.filterActiveLower)
 }
 
 func (m *model) entryPassesFilter(e entry) bool {
@@ -1385,6 +1472,7 @@ func (m *model) applyFilter(s string) {
 	m.filterErr = ""
 	m.filterIsRegex = false
 	m.filterRe = nil
+	m.filterActiveLower = strings.ToLower(s)
 	// Regex mode when starts and ends with '/'
 	if len(s) >= 2 && strings.HasPrefix(s, "/") && strings.HasSuffix(s, "/") {
 		pat := s[1 : len(s)-1]
@@ -1401,7 +1489,11 @@ func (m *model) applyFilter(s string) {
 }
 
 func (m *model) computeMatches() {
-	m.matchLineIdxs = m.matchLineIdxs[:0]
+	if cap(m.matchLineIdxs) < len(m.visibleLines) {
+		m.matchLineIdxs = make([]int, 0, len(m.visibleLines))
+	} else {
+		m.matchLineIdxs = m.matchLineIdxs[:0]
+	}
 	if m.filterActive == "" || len(m.visibleLines) == 0 {
 		return
 	}
@@ -1420,11 +1512,11 @@ func (m *model) matchLine(line string) bool {
 		return false
 	}
 	// match on the rendered line (including styles stripped for search)
-	plain := stripANSI(line)
+	plain := m.stripANSICached(line)
 	if m.filterIsRegex && m.filterRe != nil {
 		return m.filterRe.MatchString(plain)
 	}
-	return strings.Contains(strings.ToLower(plain), strings.ToLower(m.filterActive))
+	return strings.Contains(strings.ToLower(plain), m.filterActiveLower)
 }
 
 func (m *model) highlightMatches(line string) string {
@@ -1472,7 +1564,7 @@ func (m *model) renderPrimaryLine(t time.Time, rel, text string, dup int, sev se
 
 	// Path column with fixed width padding
 	p := rel
-	w := displayWidth(stripANSI(p))
+	w := m.displayWidthM(p)
 	if w > m.pathColWidth {
 		m.pathColWidth = w
 	}
@@ -1659,7 +1751,10 @@ func readNewLines(ctx context.Context, path, root string, cfg config, state *tai
 		return err
 	}
 
-	rel, _ := filepath.Rel(root, path)
+	rel, ok := relCached(root, path)
+	if !ok {
+		return nil
+	}
 	rel = filepath.Clean(rel)
 
 	// If watching multiple roots, prefix the relative path with the root's base
@@ -1695,8 +1790,8 @@ func readNewLines(ctx context.Context, path, root string, cfg config, state *tai
 }
 
 func fileMatches(root, absPath string, cfg config) bool {
-	rel, err := filepath.Rel(root, absPath)
-	if err != nil || strings.HasPrefix(rel, "..") {
+	rel, ok := relCached(root, absPath)
+	if !ok || strings.HasPrefix(rel, "..") {
 		return false
 	}
 
