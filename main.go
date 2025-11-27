@@ -111,19 +111,37 @@ func (t *tailState) setOffset(path string, curInode, curDev uint64, off int64) {
 }
 
 type model struct {
-	vp           viewport.Model
-	styleTime    lipgloss.Style
-	stylePath    lipgloss.Style
-	styleText    lipgloss.Style
-	styleInfo    lipgloss.Style
-	styleWarn    lipgloss.Style
-	styleError   lipgloss.Style
-	styleSelect  lipgloss.Style
-	cfg          config
-	err          error
-	flushDue     bool
-	flushEvery   time.Duration
-	pathColWidth int
+	vp viewport.Model
+	// Styles
+	styleTime   lipgloss.Style
+	stylePath   lipgloss.Style
+	styleText   lipgloss.Style
+	styleInfo   lipgloss.Style
+	styleWarn   lipgloss.Style
+	styleError  lipgloss.Style
+	styleSelect lipgloss.Style
+	styleHeader lipgloss.Style
+	// Header/config styling
+	styleKey       lipgloss.Style
+	styleCfgRoot   lipgloss.Style
+	styleCfgRecYes lipgloss.Style
+	styleCfgRecNo  lipgloss.Style
+	styleCfgPat    lipgloss.Style
+	// Search & match styling
+	styleSearchPrompt lipgloss.Style
+	styleSearchError  lipgloss.Style
+	styleMatch        lipgloss.Style
+	// Pane styling
+	stylePaneHeader lipgloss.Style
+	stylePaneIdx    lipgloss.Style
+	stylePanePath   lipgloss.Style
+	stylePaneTotal  lipgloss.Style
+	stylePaneActive lipgloss.Style
+	cfg             config
+	err             error
+	flushDue        bool
+	flushEvery      time.Duration
+	pathColWidth    int
 
 	// Grouping & entries
 	pending   map[string]*pendingGroup // key: relative path
@@ -193,15 +211,33 @@ func initialModel(cfg config) model {
 		styleWarn:   lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#C77D00", Dark: "#FFB020"}),
 		styleError:  lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#C00000", Dark: "#FF6B6B"}),
 		styleSelect: lipgloss.NewStyle().Reverse(true),
-		cfg:         cfg,
-		flushEvery:  80 * time.Millisecond,
-		pending:     make(map[string]*pendingGroup),
-		groupIdle:   350 * time.Millisecond,
-		expandAll:   false,
-		entriesCap:  max(1, cfg.maxLines),
-		paneWidth:   28,
-		topN:        9,
-		fileStats:   make(map[string]*fileStat),
+		styleHeader: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "#D16", Dark: "#FF79C6"}),
+		// Keys/labels subtle
+		styleKey: lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#777", Dark: "#666"}),
+		// Config values
+		styleCfgRoot:   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "#3B82F6", Dark: "#8BE9FD"}),
+		styleCfgRecYes: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "#16A34A", Dark: "#50FA7B"}),
+		styleCfgRecNo:  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "#B91C1C", Dark: "#FF6B6B"}),
+		styleCfgPat:    lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#C026D3", Dark: "#BD93F9"}),
+		// Search & match
+		styleSearchPrompt: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "#0EA5E9", Dark: "#8BE9FD"}),
+		styleSearchError:  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "#B91C1C", Dark: "#FF5555"}),
+		styleMatch:        lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#111", Dark: "#111"}).Background(lipgloss.AdaptiveColor{Light: "#FDE68A", Dark: "#F1FA8C"}).Bold(true),
+		// Pane
+		stylePaneHeader: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "#444", Dark: "#AAA"}),
+		stylePaneIdx:    lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#999", Dark: "#777"}),
+		stylePanePath:   lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#334155", Dark: "#9CDCFE"}),
+		stylePaneTotal:  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "#111", Dark: "#DDD"}),
+		stylePaneActive: lipgloss.NewStyle().Reverse(true),
+		cfg:             cfg,
+		flushEvery:      80 * time.Millisecond,
+		pending:         make(map[string]*pendingGroup),
+		groupIdle:       350 * time.Millisecond,
+		expandAll:       false,
+		entriesCap:      max(1, cfg.maxLines),
+		paneWidth:       28,
+		topN:            9,
+		fileStats:       make(map[string]*fileStat),
 	}
 	// Compile highlight regexes (case-insensitive word boundaries where applicable)
 	m.reErr = regexp.MustCompile(`(?i)\b(error|failed|fail|panic|fatal|exception)\b`)
@@ -229,7 +265,7 @@ func initialModel(cfg config) model {
 	if cfg.recursive {
 		rec = "yes"
 	}
-	m.appHeader = fmt.Sprintf("logwat — watching: %s (recursive: %s, patterns: %s)  | space: pause  /: filter  v: select  y: yank  e: expand  p: pane  1-9: jump  0: clear  q: quit",
+	m.appHeader = fmt.Sprintf("logwat — watching: %s (rec: %s, pat: %s)  | space: pause  /: filter  v: select  y: yank  e: expand  p: pane  1-9: jump  0: clear  q: quit",
 		rootsDisplay, rec, pat)
 	banner := "Started: " + m.appHeader
 	m.appendEntryWithDedup(entry{when: time.Now(), rel: "info", lines: []string{banner}})
@@ -460,6 +496,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+
+		// if user presses 0 here, clear the screen (normal mode)
+		// Only when not editing the filter and when the side pane is hidden
+		if !m.filterEditing && !m.paneVisible && msg.String() == "0" {
+			// Reset rendered state
+			m.visibleLines = m.visibleLines[:0]
+			m.matchLineIdxs = nil
+			m.curMatch = 0
+			m.selectionActive = false
+			m.selAnchor = 0
+			// Reset entries ring buffer and dedup tracking
+			m.entries = make([]entry, m.entriesCap)
+			m.entriesHead = 0
+			m.entriesSize = 0
+			m.lastKeyNoTS = ""
+			// Clear viewport content
+			m.vp.GotoTop()
+			m.rebuildViewport()
+			return m, nil
+		}
+
 		var cmd tea.Cmd
 		m.vp, cmd = m.vp.Update(msg)
 		return m, cmd
@@ -507,8 +564,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) View() string {
-	// Header: static app header + dynamic states; show filter input only on '/'
-	header := m.appHeader
+	// Header: build with colored config parts; show filter input only on '/'
+	// Build colored config summary
+	// Roots
+	rootsDisplay := ""
+	if len(m.cfg.rootDirs) > 1 {
+		absRoots := make([]string, 0, len(m.cfg.rootDirs))
+		for _, r := range m.cfg.rootDirs {
+			if a, err := filepath.Abs(r); err == nil {
+				absRoots = append(absRoots, a)
+			} else {
+				absRoots = append(absRoots, r)
+			}
+		}
+		rootsDisplay = strings.Join(absRoots, ";")
+	} else {
+		if abs, err := filepath.Abs(m.cfg.rootDir); err == nil {
+			rootsDisplay = abs
+		} else {
+			rootsDisplay = m.cfg.rootDir
+		}
+	}
+	recVal := "no"
+	recStyle := m.styleCfgRecNo
+	if m.cfg.recursive {
+		recVal = "yes"
+		recStyle = m.styleCfgRecYes
+	}
+	pat := strings.Join(m.cfg.patterns, ", ")
+	// Shortcuts legend (unchanged text, but we can dim keys)
+	legend := " | space: pause  /: filter  v: select  y: yank  e: expand  p: pane  1-9: jump  0: clear  q: quit"
+	header := "logwat — " + m.styleKey.Render("watching:") + " " + m.styleCfgRoot.Render(rootsDisplay) +
+		" (" + m.styleKey.Render("rec:") + " " + recStyle.Render(recVal) + ", " + m.styleKey.Render("pat:") + " " + m.styleCfgPat.Render(pat) + ")" + legend
 	var tags []string
 	if m.paused {
 		tags = append(tags, fmt.Sprintf("PAUSED (%d queued)", len(m.pausedQueue)))
@@ -544,12 +631,16 @@ func (m *model) View() string {
 		header = header + "  [" + strings.Join(tags, ", ") + "]"
 	}
 	if m.filterEditing {
-		header = "/" + m.filterEdit
+		// In edit mode, show styled prompt and any error
+		prompt := m.styleSearchPrompt.Render("/") + m.styleSearchPrompt.Render(m.filterEdit)
 		if m.filterErr != "" {
-			header += "  err: " + m.filterErr
+			prompt = prompt + "  " + m.styleSearchError.Render("err: ") + m.styleSearchError.Render(m.filterErr)
 		}
+		// Override whole header with prompt while editing
+		header = prompt
 	}
-	hdr := m.styleInfo.Render(header)
+	// Render prominent header in bold, slightly pink tone
+	hdr := m.styleHeader.Render(header)
 	left := m.vp.View()
 	if !m.paneVisible {
 		return hdr + "\n" + left
@@ -610,19 +701,19 @@ func (m *model) renderPane(height int) string {
 		return s
 	}
 	lines := make([]string, 0, height)
-	header := m.styleInfo.Render("Files: top")
+	header := m.stylePaneHeader.Render("Files: top")
 	lines = append(lines, truncate(header, m.paneWidth))
 	// Compose each item line
 	for i, it := range items {
-		idx := fmt.Sprintf("%d.", i+1)
+		idx := m.stylePaneIdx.Render(fmt.Sprintf("%d.", i+1))
 		// Reserve space for idx and a space
 		pathMax := m.paneWidth - 2
 		if pathMax < 4 {
 			pathMax = 4
 		}
-		path := truncate(it.rel, pathMax)
+		path := truncate(m.stylePanePath.Render(it.rel), pathMax)
 		// Build counts tail compactly; prioritize total on the right if room allows
-		counts := fmt.Sprintf(" %d ", it.st.total)
+		counts := m.stylePaneTotal.Render(fmt.Sprintf(" %d ", it.st.total))
 		// Ensure the final line does not exceed paneWidth
 		base := idx + " " + path
 		// If too long, shrink path
@@ -660,6 +751,10 @@ func (m *model) renderPane(height int) string {
 			// pad spaces
 			pad := m.paneWidth - displayWidth(line+counts)
 			line = line + strings.Repeat(" ", pad) + counts
+		}
+		// Highlight active selection
+		if m.fileFilterRel == it.rel {
+			line = m.stylePaneActive.Render(line)
 		}
 		lines = append(lines, line)
 		if len(lines) >= height {
@@ -1338,7 +1433,7 @@ func (m *model) highlightMatches(line string) string {
 	}
 	// naive highlighting on plain text, then re-apply by replacing segments in the original
 	// Since ANSI already present, we will apply a simple regex to the raw string; this is not perfect
-	style := lipgloss.NewStyle().Reverse(true)
+	style := m.styleMatch
 	if m.filterIsRegex && m.filterRe != nil {
 		return m.filterRe.ReplaceAllStringFunc(line, func(s string) string { return style.Render(s) })
 	}
