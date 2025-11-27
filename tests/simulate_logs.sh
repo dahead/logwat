@@ -62,7 +62,7 @@ while true; do
   log_file="$LOG_DIR/${LOG_FILES[$((RANDOM % ${#LOG_FILES[@]}))]}"
   
   # Generate 1-3 log lines per iteration
-  num_lines=$((RANDOM % 3 + 1))
+  num_lines=$((RANDOM % 30 + 1))
   for ((i = 0; i < num_lines; i++)); do
     generate_log_line >> "$log_file"
   done

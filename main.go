@@ -1402,7 +1402,36 @@ func (m *model) rebuildViewport() {
 			}
 		}
 	}
-	// compute search matches on the freshly rendered lines
+	// Limit rendered lines to a tail window to cap per-flush work.
+	// This avoids rebuilding and styling the entire history on every tick.
+	renderLimit := m.vp.Height * 4
+	if renderLimit < 200 { // safety floor; avoid too-small windows
+		renderLimit = 200
+	}
+	trim := 0
+	if len(out) > renderLimit {
+		trim = len(out) - renderLimit
+		out = out[trim:]
+	}
+
+	// Adjust selection/YOffset when trimming the head so indices remain valid.
+	if m.selectionActive {
+		if m.selAnchor < trim {
+			m.selAnchor = 0
+		} else {
+			m.selAnchor -= trim
+		}
+		if m.selAnchor >= len(out) {
+			m.selAnchor = max(0, len(out)-1)
+		}
+	}
+	if len(out) == 0 {
+		m.vp.YOffset = 0
+	} else if m.vp.YOffset >= len(out) {
+		m.vp.YOffset = len(out) - 1
+	}
+
+	// compute search matches on the freshly rendered (possibly trimmed) lines
 	m.visibleLines = out
 	m.computeMatches()
 	// Build the final content with a strings.Builder to minimize allocations
