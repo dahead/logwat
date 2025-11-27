@@ -31,11 +31,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"logwat/platform"
+
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fsnotify/fsnotify"
-	"logwat/platform"
 )
 
 // small generic-less helper (Go 1.20 compatible) used for capacities
@@ -1565,6 +1566,7 @@ func readNewLines(ctx context.Context, path, root string, cfg config, state *tai
 
 	rel, _ := filepath.Rel(root, path)
 	rel = filepath.Clean(rel)
+
 	// If watching multiple roots, prefix the relative path with the root's base
 	// directory to avoid ambiguous names across roots.
 	if len(cfg.rootDirs) > 1 {
@@ -1596,10 +1598,6 @@ func readNewLines(ctx context.Context, path, root string, cfg config, state *tai
 
 	return scanner.Err()
 }
-
-// inodeDev returns inode and device id for Linux/Unix platforms; on unsupported
-// systems it returns zeros, which will degrade to path-only tracking.
-// inodeDev is implemented per-OS in separate files via build tags.
 
 func fileMatches(root, absPath string, cfg config) bool {
 	rel, err := filepath.Rel(root, absPath)
