@@ -69,7 +69,7 @@ logwat "C:/ProgramData/Microsoft/IntuneManagementExtension/Logs" "*.log" --recur
 - Space: pause/resume; while paused, use `j`/`k` to step through queued items
 - p: toggle side pane (file list)
 - 1–9: when pane is visible, jump to the Nth file in the pane
-- 0: when pane is visible, clear file filter (show all files)
+- 0: Clear screen. When pane is visible, clear file filter (show all files)
 - /: start editing the live filter; Enter applies, Esc clears and exits
 - n / N: jump to next / previous match (when a filter is active)
 - v: start/end visual selection

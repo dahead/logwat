@@ -67,6 +67,6 @@ while true; do
     generate_log_line >> "$log_file"
   done
   
-  ms=$((RANDOM % 100))
+  ms=$((RANDOM % 60))
   sleep "0.$(printf '%03d' "$ms")"
 done
