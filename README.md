@@ -2,7 +2,7 @@
 
 Tail multiple log files with a fast, lightweight terminal UI. Point it at a directory and see new lines as they arrive, with filtering, include/exclude globs, per-file pane, pause/resume, search, selection/yank, severity highlighting, deduplication, and more.
 
-![Screenshot](screenshots/logwat.png)
+![Screenshot](screenshots/screenshot2.png)
 
 ## Requirements
 - Go 1.24+
